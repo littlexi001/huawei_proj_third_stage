@@ -7,11 +7,17 @@ Qwen3-0.6B:
 低秩主分量 + 残差 NVFP4(E2M1B, nosr) 量化 的 MMLU 评测脚本
 修复版：SVD/QR/quant 强制在 FP32 + autocast disabled 下执行，避免 BF16 geqrf_cuda 报错
 
-核心算子:
+    核心算子:
     W = W_m + W_r
     X = X_m + X_r
 
-    y = (W_m + Quant(W_r)) * (X_m + Quant(X_r))
+    y = X_m W_m^T
+      + Quant(X_m) Quant(W_r)^T
+      + Quant(X_r) Quant(W_m)^T
+      + Quant(X_r) Quant(W_r)^T
+
+    只有 low-rank * low-rank 项保持 BF16；涉及 residual 的项会把另一侧
+    low-rank 临时量化到 FP4 值域后再做乘法模拟。
 
 这里默认只对 Transformer block 中 7 个主要线性层做替换:
     self_attn.{q_proj,k_proj,v_proj,o_proj}
@@ -255,12 +261,14 @@ def low_rank_approx(x: torch.Tensor, rank: int, method: str = "full") -> torch.T
 class SVDRQuantLinear(nn.Module):
     """
     将原线性层替换为:
-        y = linear(X_m + Q(X_r), W_m + Q(W_r), b)
+        y = linear(X_m, W_m, b)
+          + linear(Q(X_m), Q(W_r))
+          + linear(Q(X_r), Q(W_m))
+          + linear(Q(X_r), Q(W_r))
 
     其中:
-        W_m: 预先算好并缓存
-        Q(W_r): 预先量化并缓存
-        X_m / Q(X_r): 每次 forward 在线计算
+        W_m / Q(W_m) / Q(W_r): 预先算好并缓存
+        X_m / Q(X_m) / Q(X_r): 每次 forward 在线计算
     """
     def __init__(
         self,
@@ -308,8 +316,10 @@ class SVDRQuantLinear(nn.Module):
                 w_r = w_fp - w_m
 
             w_rq = quant_tensor(w_r, qtype=self.qtype, q_scalar=self.q_scalar_w)
+            w_mq = quant_tensor(w_m, qtype=self.qtype, q_scalar=self.q_scalar_w)
 
             self.register_buffer("weight_main", w_m.to(dtype=self.store_dtype, device=device), persistent=True)
+            self.register_buffer("weight_main_q", w_mq.to(dtype=self.store_dtype, device=device), persistent=True)
             self.register_buffer("weight_resid_q", w_rq.to(dtype=self.store_dtype, device=device), persistent=True)
 
             if base_linear.bias is not None:
@@ -329,7 +339,7 @@ class SVDRQuantLinear(nn.Module):
             )
 
     @torch.no_grad()
-    def _decompose_activation(self, x: torch.Tensor) -> torch.Tensor:
+    def _decompose_activation(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         x: [..., hidden]
         将 x reshape 成 [tokens, hidden] 后做低秩近似
@@ -353,15 +363,24 @@ class SVDRQuantLinear(nn.Module):
             x_r = x_fp - x_m
 
         x_rq = quant_tensor(x_r, qtype=self.qtype, q_scalar=self.q_scalar_x)
-        x_hat = x_m + x_rq
-        x_hat = x_hat.reshape(orig_shape).to(dtype=self.compute_dtype)
-        return x_hat
+        x_mq = quant_tensor(x_m, qtype=self.qtype, q_scalar=self.q_scalar_x)
+
+        x_m = x_m.reshape(orig_shape).to(dtype=self.compute_dtype)
+        x_mq = x_mq.reshape(orig_shape).to(dtype=self.compute_dtype)
+        x_rq = x_rq.reshape(orig_shape).to(dtype=self.compute_dtype)
+        return x_m, x_mq, x_rq
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_hat = self._decompose_activation(x)
-        w_hat = (self.weight_main + self.weight_resid_q).to(dtype=self.compute_dtype)
+        x_m, x_mq, x_rq = self._decompose_activation(x)
+        w_m = self.weight_main.to(dtype=self.compute_dtype)
+        w_mq = self.weight_main_q.to(dtype=self.compute_dtype)
+        w_rq = self.weight_resid_q.to(dtype=self.compute_dtype)
         b = self.bias.to(dtype=self.compute_dtype) if self.bias is not None else None
-        out = F.linear(x_hat, w_hat, b)
+
+        out = F.linear(x_m, w_m, b)
+        out = out + F.linear(x_mq, w_rq, None)
+        out = out + F.linear(x_rq, w_mq, None)
+        out = out + F.linear(x_rq, w_rq, None)
         return out
 
 
