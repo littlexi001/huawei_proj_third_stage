@@ -17,6 +17,7 @@ nohup python "${SCRIPT}" \
   --output_dir "${OUTPUT_DIR}" \
   --gpu_ids "0,1,2,3,4,5,6,7" \
   --rank_grid "0,5,10,15,20,25,30,40,50,60,80,100" \
+  --run_unquantized_baseline \
   --qtype "nvfp4e2m1bnosr" \
   --q_scalar_w 1.0 \
   --q_scalar_x 1.0 \

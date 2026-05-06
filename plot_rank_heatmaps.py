@@ -21,8 +21,8 @@ def parse_args():
     p.add_argument(
         "--baseline",
         type=float,
-        default=0.40,
-        help="baseline accuracy，默认 0.40",
+        default=None,
+        help="baseline accuracy；默认优先读取 root/baseline_unquantized/summary.json，否则使用 0.40",
     )
     p.add_argument(
         "--save_dir",
@@ -91,6 +91,18 @@ def collect_results(root: Path):
         results[(wr, xr)] = acc
 
     return results
+
+
+def load_unquantized_baseline(root: Path):
+    summary_path = root / "baseline_unquantized" / "summary.json"
+    if not summary_path.exists():
+        return None
+    try:
+        obj = json.loads(summary_path.read_text(encoding="utf-8"))
+        return float(obj["overall_acc"])
+    except Exception as exc:
+        print(f"[WARN] failed to parse baseline summary {summary_path}: {exc}")
+        return None
 
 
 def build_matrix(results):
@@ -182,8 +194,15 @@ def main():
         raise RuntimeError("No valid results found. Please check root path and worker.log contents.")
 
     wranks, xranks, acc_mat = build_matrix(results)
+    baseline = args.baseline
+    if baseline is None:
+        baseline = load_unquantized_baseline(root)
+    if baseline is None:
+        baseline = 0.40
+        print("[WARN] no --baseline and no baseline_unquantized/summary.json found; using 0.40")
+
     # rel_pct_mat = (acc_mat - args.baseline) / args.baseline * 100.0
-    rel_pct_mat = (acc_mat - args.baseline)
+    rel_pct_mat = (acc_mat - baseline)
 
     np.save(save_dir / "acc_matrix.npy", acc_mat)
     np.save(save_dir / "rel_pct_matrix.npy", rel_pct_mat)
@@ -206,7 +225,7 @@ def main():
         mat=rel_pct_mat,
         wranks=wranks,
         xranks=xranks,
-        title=f"MMLU Relative Change vs Baseline={args.baseline:.5f}",
+        title=f"MMLU Relative Change vs Baseline={baseline:.5f}",
         cbar_label="relative change",
         save_path=save_dir / "heatmap_relative_percent.png",
         value_fmt="{:+.3f}",
@@ -230,7 +249,7 @@ def main():
         mat=rel_pct_mat,
         wranks=wranks,
         xranks=xranks,
-        title=f"MMLU Relative Change vs Baseline={args.baseline:.3f} (%)",
+        title=f"MMLU Relative Change vs Baseline={baseline:.3f} (%)",
         cbar_label="relative change (%)",
         save_path=save_dir / "heatmap_relative_percent.pdf",
         value_fmt="{:+.1f}",
@@ -241,6 +260,7 @@ def main():
     print("[Done]")
     print(f"results found: {len(results)}")
     print(f"save_dir: {save_dir}")
+    print(f"baseline: {baseline:.6f}")
     print(f"wranks: {wranks}")
     print(f"xranks: {xranks}")
 

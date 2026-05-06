@@ -26,7 +26,8 @@ Qwen3-0.6B:
 功能:
 1) 单个 (weight_rank, act_rank) 评测
 2) 12x12 网格任务自动分发到多张 GPU
-3) 结果按 json 保存，便于后续汇总画图
+3) 可选运行完全不量化的 baseline
+4) 结果按 json 保存，便于后续汇总画图
 
 依赖:
     pip install torch transformers datasets tqdm
@@ -531,6 +532,7 @@ class EvalConfig:
     max_eval_samples_per_subject: int = -1
     subject_filter: str = ""
     seed: int = 42
+    no_quant: bool = False
     verbose: bool = False
 
 
@@ -550,21 +552,25 @@ def evaluate_mmlu(cfg: EvalConfig) -> Dict[str, Any]:
     model.to(device)
     model.eval()
 
-    replaced = patch_model_linears(
-        model=model,
-        weight_rank=cfg.weight_rank,
-        act_rank=cfg.act_rank,
-        qtype=cfg.qtype,
-        q_scalar_w=cfg.q_scalar_w,
-        q_scalar_x=cfg.q_scalar_x,
-        svd_method_w=cfg.svd_method_w,
-        svd_method_x=cfg.svd_method_x,
-        compute_dtype=compute_dtype,
-        store_dtype=store_dtype,
-        verbose=cfg.verbose,
-    )
+    if cfg.no_quant:
+        replaced = []
+    else:
+        replaced = patch_model_linears(
+            model=model,
+            weight_rank=cfg.weight_rank,
+            act_rank=cfg.act_rank,
+            qtype=cfg.qtype,
+            q_scalar_w=cfg.q_scalar_w,
+            q_scalar_x=cfg.q_scalar_x,
+            svd_method_w=cfg.svd_method_w,
+            svd_method_x=cfg.svd_method_x,
+            compute_dtype=compute_dtype,
+            store_dtype=store_dtype,
+            verbose=cfg.verbose,
+        )
 
     meta = {
+        "no_quant": cfg.no_quant,
         "replaced_num_modules": len(replaced),
         "replaced_modules": replaced,
     }
@@ -599,7 +605,8 @@ def evaluate_mmlu(cfg: EvalConfig) -> Dict[str, Any]:
 
     start_time = time.time()
 
-    for subject in tqdm(subjects, desc=f"Eval rW={cfg.weight_rank}, rX={cfg.act_rank}"):
+    desc = "Eval unquantized baseline" if cfg.no_quant else f"Eval rW={cfg.weight_rank}, rX={cfg.act_rank}"
+    for subject in tqdm(subjects, desc=desc):
         dev_examples = dev_by_subject[subject][:cfg.ntrain]
         cur_eval = eval_by_subject[subject]
 
@@ -655,6 +662,7 @@ def evaluate_mmlu(cfg: EvalConfig) -> Dict[str, Any]:
         "total_count": total_count,
         "per_subject": per_subject,
         "elapsed_sec": end_time - start_time,
+        "no_quant": cfg.no_quant,
         "patched_num_modules": len(replaced),
     }
 
@@ -675,14 +683,19 @@ def worker_output_dir(root: str, weight_rank: int, act_rank: int) -> str:
     return os.path.join(root, f"wrank_{weight_rank}_xrank_{act_rank}")
 
 
+def baseline_output_dir(root: str) -> str:
+    return os.path.join(root, "baseline_unquantized")
+
+
 def spawn_one_worker(
     script_path: str,
     gpu_id: int,
     base_args: argparse.Namespace,
     weight_rank: int,
     act_rank: int,
+    no_quant: bool = False,
 ) -> subprocess.Popen:
-    outdir = worker_output_dir(base_args.output_dir, weight_rank, act_rank)
+    outdir = baseline_output_dir(base_args.output_dir) if no_quant else worker_output_dir(base_args.output_dir, weight_rank, act_rank)
     ensure_dir(outdir)
 
     cmd = [
@@ -707,6 +720,8 @@ def spawn_one_worker(
         "--subject_filter", base_args.subject_filter,
         "--seed", str(base_args.seed),
     ]
+    if no_quant:
+        cmd.append("--no_quant")
     if base_args.verbose:
         cmd.append("--verbose")
 
@@ -725,12 +740,15 @@ def spawn_one_worker(
     proc._assigned_gpu = gpu_id    # type: ignore[attr-defined]
     proc._wrank = weight_rank      # type: ignore[attr-defined]
     proc._xrank = act_rank         # type: ignore[attr-defined]
+    proc._no_quant = no_quant      # type: ignore[attr-defined]
     return proc
 
 
 def run_grid_scheduler(args: argparse.Namespace) -> None:
     ranks = [int(x) for x in args.rank_grid.split(",") if x.strip()]
-    tasks = [(wr, xr) for wr in ranks for xr in ranks]
+    tasks = [(False, wr, xr) for wr in ranks for xr in ranks]
+    if args.run_unquantized_baseline:
+        tasks.insert(0, (True, 0, 0))
 
     ensure_dir(args.output_dir)
     status_path = os.path.join(args.output_dir, "grid_status.jsonl")
@@ -752,13 +770,14 @@ def run_grid_scheduler(args: argparse.Namespace) -> None:
         # 尽量填满 GPU
         while pending and not free_gpus.empty():
             gid = free_gpus.get()
-            wr, xr = pending.pop(0)
-            outdir = worker_output_dir(args.output_dir, wr, xr)
+            no_quant, wr, xr = pending.pop(0)
+            outdir = baseline_output_dir(args.output_dir) if no_quant else worker_output_dir(args.output_dir, wr, xr)
             summary_path = os.path.join(outdir, "summary.json")
 
             if os.path.exists(summary_path):
                 rec = {
                     "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "no_quant": no_quant,
                     "weight_rank": wr,
                     "act_rank": xr,
                     "gpu": gid,
@@ -769,10 +788,11 @@ def run_grid_scheduler(args: argparse.Namespace) -> None:
                 free_gpus.put(gid)
                 continue
 
-            proc = spawn_one_worker(script_path, gid, args, wr, xr)
+            proc = spawn_one_worker(script_path, gid, args, wr, xr, no_quant=no_quant)
             running.append(proc)
             rec = {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "no_quant": no_quant,
                 "weight_rank": wr,
                 "act_rank": xr,
                 "gpu": gid,
@@ -781,7 +801,8 @@ def run_grid_scheduler(args: argparse.Namespace) -> None:
                 "output_dir": outdir,
             }
             jsonl_append(rec, status_path)
-            print(f"[Launch] GPU {gid} <- (w={wr}, x={xr}), pid={proc.pid}")
+            label = "baseline_unquantized" if no_quant else f"w={wr}, x={xr}"
+            print(f"[Launch] GPU {gid} <- ({label}), pid={proc.pid}")
 
         # 回收完成任务
         still_running = []
@@ -794,21 +815,24 @@ def run_grid_scheduler(args: argparse.Namespace) -> None:
             gid = proc._assigned_gpu  # type: ignore[attr-defined]
             wr = proc._wrank          # type: ignore[attr-defined]
             xr = proc._xrank          # type: ignore[attr-defined]
+            no_quant = proc._no_quant # type: ignore[attr-defined]
             proc._log_file_handle.close()  # type: ignore[attr-defined]
             free_gpus.put(gid)
 
             rec = {
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "no_quant": no_quant,
                 "weight_rank": wr,
                 "act_rank": xr,
                 "gpu": gid,
                 "status": "finished" if ret == 0 else "failed",
                 "returncode": ret,
                 "pid": proc.pid,
-                "output_dir": worker_output_dir(args.output_dir, wr, xr),
+                "output_dir": baseline_output_dir(args.output_dir) if no_quant else worker_output_dir(args.output_dir, wr, xr),
             }
             jsonl_append(rec, status_path)
-            print(f"[Done] GPU {gid} <- (w={wr}, x={xr}), returncode={ret}")
+            label = "baseline_unquantized" if no_quant else f"w={wr}, x={xr}"
+            print(f"[Done] GPU {gid} <- ({label}), returncode={ret}")
 
         running = still_running
         time.sleep(5)
@@ -840,6 +864,7 @@ def build_parser():
     p.add_argument("--max_eval_samples_per_subject", type=int, default=-1)
     p.add_argument("--subject_filter", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no_quant", action="store_true", help="worker: evaluate the original model without quantization patches")
     p.add_argument("--verbose", action="store_true")
 
     # worker
@@ -849,6 +874,7 @@ def build_parser():
     # grid
     p.add_argument("--rank_grid", type=str, default="0,5,10,15,20,25,30,40,50,60,80,100")
     p.add_argument("--gpu_ids", type=str, default="0,1,2,3,4,5,6,7")
+    p.add_argument("--run_unquantized_baseline", action="store_true")
 
     return p
 
@@ -878,6 +904,7 @@ def main():
         max_eval_samples_per_subject=args.max_eval_samples_per_subject,
         subject_filter=args.subject_filter,
         seed=args.seed,
+        no_quant=args.no_quant,
         verbose=args.verbose,
     )
     result = evaluate_mmlu(cfg)
@@ -887,6 +914,7 @@ def main():
         "total_count": result["total_count"],
         "weight_rank": cfg.weight_rank,
         "act_rank": cfg.act_rank,
+        "no_quant": cfg.no_quant,
     }, ensure_ascii=False, indent=2))
 
 
