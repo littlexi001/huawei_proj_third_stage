@@ -1,4 +1,3 @@
-
 import torch
 
 
@@ -45,7 +44,6 @@ class Cast2Fp4e2m1(QuantFunc):
     @classmethod
     @torch.no_grad()
     def quant(cls, x: torch.Tensor, s: torch.Tensor):
-        
         xsign = x.sign()
         x = x.abs() / (s / 2)
         
@@ -53,7 +51,6 @@ class Cast2Fp4e2m1(QuantFunc):
         x -= (x - 4).relu_() / 2 + (x - 8).relu_() / 4
         x.round_()
         x += (x - 4).relu_() + (x - 6).relu_() * 2      
-        
         return x * xsign / 2
     
 class Cast2Fp4e2m1Random(QuantFunc):
@@ -224,13 +221,6 @@ class Cast2NVFp4e2m1Block(BlockQuantFunc):
     @torch.no_grad()
     def quant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
-        # smax = s.abs().max()        
-        # # print("Origin", s.max(), s.shape)
-        # s /= smax / 448
-        # # print("Before to",s.max())
-        # s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32) + 1e-10
-        # # print("After to",s.max())
-        # s *= smax / 448
         x, s = BlockQuantFunc._reshape(x, s)
         return Cast2Fp4e2m1Random.quant(x, s).view(xshape)
     
@@ -239,12 +229,12 @@ class Cast2NVFp4e2m1Block(BlockQuantFunc):
     def rquant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
         smax = s.abs().max()
-        s /= smax / 448
-        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)
+        s = s / (smax / 448)            
+        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=x.dtype)                    
         s *= smax / 448
         
         x, s = BlockQuantFunc._reshape(x, s)
-        return Cast2Fp4e2m1Random.rquant(x, s).view(xshape)
+        return Cast2Fp4e2m1.rquant(x, s).view(xshape)
     
 class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
     @classmethod
@@ -271,10 +261,6 @@ class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
     @torch.no_grad()
     def quant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
-        # smax = s.abs().max()
-        # s /= smax / 448
-        # s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)
-        # s *= smax / 448
         x, s = BlockQuantFunc._reshape(x, s)
         return Cast2Fp4e2m1.quant(x, s).view(xshape)
     
@@ -283,13 +269,12 @@ class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
     def rquant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
         smax = s.abs().max()
-        s /= smax / 448
-        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=x.dtype)
+        s = s / (smax / 448)
+        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=x.dtype)          
         s *= smax / 448
         
         x, s = BlockQuantFunc._reshape(x, s)
         return Cast2Fp4e2m1.rquant(x, s).view(xshape)
-
 
 class Cast2Fp4e2m1Block(BlockQuantFunc):
     @classmethod
@@ -402,795 +387,194 @@ def cast_2_fp32(x):
     return x
 
 
-# --------------------------------LNS开始-----------------------------------
-class Cast2LNS4_QDQ(BlockQuantFunc):
-    """
-    LNS4 (4-bit) fake-quantization (QDQ style):
-      - Linear-domain stochastic rounding onto {0} ∪ {±2^(k-bias), k=1..7}
-      - Block-wise scaling controlled by *global* BlockQuantFunc.block_shape
-      - rquant() casts s to FP8 e4m3 and back before multiplying
-    """
-    # 固定默认偏置（可随时在外部改：Cast2LNS4_QDQ.default_bias = 2/3/...）
-    default_bias = 3
-
+class Cast2Hif4(QuantFunc):
     @classmethod
     @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        返回按块（或全局）计算的 scale 网格：
-          s_block = amax_block / 2^(7 - bias) + eps
-        说明：
-          - 把归一化 |x|/s 后的可表示上界对齐到 2^(7-bias)
-          - block_size 由 BlockQuantFunc.block_shape 控制
-        """
-        if bias is None:
-            bias = cls.default_bias
+    def get_scalar(cls, x: torch.Tensor):
+        qdim = -1
+        x = x.reshape(-1, x.shape[-1])
+        x = x.unflatten(qdim, (-1, 8, 2, 4))
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+        
+        # compute initial shared exp 
+        max_lv3 = torch.max(x_unsigned, dim=qdim, keepdim=True)[0]
+        max_lv2 = torch.max(max_lv3, dim=qdim-1, keepdim=True)[0]
+        max_lv1 = torch.max(max_lv2, dim=qdim-2, keepdim=True)[0]
+        
+        div7 = torch.ones_like(max_lv1) / 7.0
+        div7 = div7.to(torch.bfloat16).to(x.dtype)
+        scale_factor = max_lv1 * div7
+        scale_factor = (scale_factor).to(torch.bfloat16).to(x.dtype).clip(min=2 ** (-48), max=49152) 
+        ## change to tobf16(rint)
+        e_sf = torch.floor(torch.log2(scale_factor))
+        mant_sf = scale_factor / 2**e_sf * 2**7
+        scale_factor = torch.round(mant_sf) / 2**7 * 2**e_sf
 
-        # 把输入摊成 [rows, cols]，按最后一维分块
-        x2 = x.reshape(-1, x.shape[-1])
-        rows, cols = x2.shape
-        brows, bcols = BlockQuantFunc.block_shape    # 全局控制 block_size / global scaling
-        assert (rows % brows == 0) and (cols % bcols == 0), "block_shape must divide input shape"
-
-        # 每块取绝对值最大值（absmax）
-        amax = (
-            x2.abs()
-              .view(rows // brows, brows, cols // bcols, bcols)
-              .amax(dim=(1, 3), keepdim=False)       # [rows//brows, cols//bcols]
-        )
-
-        # 上界对齐：LNS4 非零最大幂是 2^(7-bias)
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)   # FP32 网格
-        return s
-
+        
+        # scale_factor to e6m2
+        e_sf = torch.floor(torch.log2(scale_factor))
+        scale_factor = torch.round(scale_factor * torch.exp2(2-e_sf)) * torch.exp2(e_sf-2)
+        
+        rec_sf = (1.0 / scale_factor).to(torch.bfloat16).to(x.dtype)
+        scale_lv2 = (max_lv2 * rec_sf)
+        scale_lv2 = torch.exp2((scale_lv2.clip(0, 4) / 4).floor())
+        scale_lv3 = torch.exp2(((max_lv3 * rec_sf / scale_lv2).clip(0, 2) / 2).floor())
+        
+        return scale_lv2 * scale_lv3 / rec_sf
+    
     @classmethod
     @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        量化（QDQ 风格，返回仍为浮点）：
-          1) 归一化 a = |x|/s
-          2) 在线性域随机舍入到最近两幂（或 {0, 2^(1-bias)}），并按距离确定上抬概率
-          3) 乘回符号，得到假量化浮点 q（仍 FP32）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
+    def quant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)  # 把 s 按块广播到元素位
-        xsign  = x4.sign()
-        a      = (x4.abs() / s4).clamp(min=0.0)  # 归一化幅值，非负
-
-        # LNS4 网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零幂
-        max_nz = 2.0 ** (7 - bias)   # 最大非零幂
-
-        qmag = torch.zeros_like(a)
-
-        # 区间一：0 < a < min_nz → 在 {0, min_nz} 之间随机
-        mask = (a > 0) & (a < min_nz)
-        if mask.any():
-            p = (a[mask] / min_nz).clamp(0.0, 1.0)                       # 线性距离概率
-            qmag[mask] = torch.where(torch.rand_like(p) < p, min_nz, 0.) # 随机择近
-
-        # 区间二：min_nz ≤ a < max_nz → 在相邻幂 {rL, rU=2*rL} 之间随机
-        mask = (a >= min_nz) & (a < max_nz)
-        if mask.any():
-            a2 = a[mask]
-            k  = torch.floor(torch.log2(a2))       # 左侧幂指数
-            rL = torch.pow(2.0, k)                 # 左端幂
-            rU = rL * 2.0                          # 右端幂
-            p  = ((a2 - rL) / (rU - rL)).clamp(0.0, 1.0)  # 线性插值概率
-            qmag[mask] = torch.where(torch.rand_like(p) < p, rU, rL)
-
-        # 区间三：a ≥ max_nz → 饱和到最大幂
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        q = (xsign * qmag).view(xshape)  # 假量化后的“浮点”值（仍在归一化域）
-        return q
-
+        qdim = -1
+        man_bits = 3
+        x = x.reshape(-1, x.shape[-1])
+        x = x.unflatten(qdim, (-1, 8, 2, 4))
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+        
+        mant = x_unsigned / s
+        mant = torch.floor(mant * 2**(man_bits - 1) + 0.5) / 2**(man_bits - 1)
+        mant[mant>=2] = 2 - 2**(-man_bits+1)
+        mant = sign * mant
+        mant = mant.flatten(qdim-3, qdim)
+        return  mant.view(xshape)#output of shape (dim1, (-1, 8, 2, 4))
+    
     @classmethod
     @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 把 s cast 到 FP8 e4m3 再回 FP32（模拟低精读回）
-          - 乘回：x_hat = x * s_fp8
-          - 返回 FP32（供后续 GEMM/SVD 等浮点算子使用）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
+    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
+        # print(x.shape)
+        qdim = -1
         xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)
-        s_fp8  = s4.to(torch.float8_e4m3fn).to(torch.float32)
-        return (x4 * s_fp8).view(xshape)
-
-
-
-
-
-
-class Cast2LNS4_nsr(BlockQuantFunc):
-    """
-    LNS4 (4-bit) fake-quantization (QDQ style):
-      - Linear-domain ROUND-TO-NEAREST onto {0} ∪ {±2^(k-bias), k=1..7}
-      - Block-wise scaling controlled by *global* BlockQuantFunc.block_shape
-      - rquant() casts s to FP8 e4m3 and back before multiplying
-    """
-    # 固定默认偏置（可在外部随时改：Cast2LNS4_nsr.default_bias = 2/3/...）
-    default_bias = 3
-
+        x = x.reshape(-1, x.shape[-1])
+        x = x.unflatten(qdim, (-1, 8, 2, 4))
+        out = x * s
+        out = out.flatten(qdim-3, qdim)
+        return out.view(xshape)
+    
+    
+class Cast2Hif4SR(QuantFunc):
     @classmethod
     @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        返回按块（或全局）计算的 scale 网格：
-          s_block = amax_block / 2^(7 - bias) + eps
-        说明：
-          - 归一化 |x|/s 后的可表示上界对齐到 2^(7-bias)
-          - block_size 由 BlockQuantFunc.block_shape 控制
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        # 摊成二维，按最后一维分块
-        x2 = x.reshape(-1, x.shape[-1])
-        rows, cols = x2.shape
-        brows, bcols = BlockQuantFunc.block_shape
-        assert (rows % brows == 0) and (cols % bcols == 0), "block_shape must divide input"
-
-        # 每块 absmax
-        amax = (
-            x2.abs()
-              .view(rows // brows, brows, cols // bcols, bcols)
-              .amax(dim=(1, 3), keepdim=False)   # [rows//brows, cols//bcols]
-        )
-
-        # 上界对齐到 2^(7-bias)
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s
-
+    def get_scalar(cls, x: torch.Tensor):
+        return Cast2Hif4.get_scalar(x)
+    
     @classmethod
     @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        量化（QDQ 风格，返回仍为浮点）：
-          1) 归一化 a = |x|/s
-          2) 在线性域“就近四舍五入”到最近的幂（或 {0, 2^(1-bias)}）
-          3) 乘回符号，得到假量化浮点 q（仍 FP32）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
+    def quant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)  # 把 s 按块广播到元素位
-        xsign  = x4.sign()
-        a      = (x4.abs() / s4).clamp(min=0.0)  # 归一化幅值
-
-        # LNS4 网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零幂
-        max_nz = 2.0 ** (7 - bias)   # 最大非零幂
-
-        # qmag：就近“四舍五入”到网格点
-        qmag = torch.zeros_like(a)
-
-        # 区间一：0 < a < min_nz   → 与 {0, min_nz} 比较，阈值为 min_nz/2
-        mask1 = (a > 0) & (a < min_nz)
-        if mask1.any():
-            mid = 0.5 * min_nz
-            qmag[mask1] = torch.where(a[mask1] >= mid, torch.full_like(a[mask1], min_nz), torch.zeros_like(a[mask1]))
-
-        # 区间二：min_nz ≤ a < max_nz → 找相邻幂 rL 与 rU=2*rL，阈值为 (rL + rU)/2 = 1.5*rL
-        mask2 = (a >= min_nz) & (a < max_nz)
-        if mask2.any():
-            a2 = a[mask2]
-            k  = torch.floor(torch.log2(a2))
-            rL = torch.pow(2.0, k)          # 左端幂
-            rU = rL * 2.0                   # 右端幂
-            mid = 0.5 * (rL + rU)           # 线性域中点
-            qmag[mask2] = torch.where(a2 >= mid, rU, rL)
-
-        # 区间三：a >= max_nz → 饱和到最大幂
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        q = (xsign * qmag).view(xshape)  # 假量化后的“浮点”值（仍在归一化域）
-        return q
-
+        qdim = -1
+        man_bits = 3
+        x = x.reshape(-1, x.shape[-1])
+        x = x.unflatten(qdim, (-1, 8, 2, 4))
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+        
+        mant = x_unsigned / s        
+        q = 2**(man_bits - 1)
+        # mant = torch.floor(mant * 2**(man_bits - 1) + 0.5) / 2**(man_bits - 1)
+        #TODO: check SR
+        mant = torch.floor(mant * q + torch.rand_like(mant * q)) / q
+        mant[mant>=2] = 2 - 2**(-man_bits+1)
+        mant = sign * mant
+        mant = mant.flatten(qdim-3, qdim)
+        return  mant.view(xshape)#output of shape (dim1, (-1, 8, 2, 4))  
+    
     @classmethod
     @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 把 s cast 到 FP8 e4m3 再回 FP32（模拟低精读回）
-          - 乘回：x_hat = x * s_fp8
-          - 返回 FP32（供后续 GEMM/SVD 等浮点算子使用）
-        """
-        if bias is None:
-            bias = cls.default_bias
+    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
+        return Cast2Hif4.rquant(x, s)
+    
+    
+class Cast2Hif4SSR(QuantFunc):
+    @classmethod
+    @torch.no_grad()
+    def get_scalar(cls, x: torch.Tensor):
+        qdim = -1
+        x = x.reshape(-1, x.shape[-1])
+        x = x.unflatten(qdim, (-1, 8, 2, 4))
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+        
+        # compute initial shared exp 
+        max_lv3 = torch.max(x_unsigned, dim=qdim, keepdim=True)[0]
+        max_lv2 = torch.max(max_lv3, dim=qdim-1, keepdim=True)[0]
+        max_lv1 = torch.max(max_lv2, dim=qdim-2, keepdim=True)[0]
+        
+        div7 = torch.ones_like(max_lv1) / 7.0
+        div7 = div7.to(torch.bfloat16).to(x.dtype)
+        scale_factor = max_lv1 * div7
+        scale_factor = (scale_factor).to(torch.bfloat16).to(x.dtype).clip(min=2 ** (-48), max=49152) 
+        ## change to tobf16(rint)
+        e_sf = torch.floor(torch.log2(scale_factor))
+        mant_sf = scale_factor / 2**e_sf * 2**7        
+        scale_factor = torch.floor(mant_sf + torch.rand_like(mant_sf)) / 2**7 * 2**e_sf
 
+        
+        # scale_factor to e6m2
+        e_sf = torch.floor(torch.log2(scale_factor))        
+        scale_factor = torch.floor(scale_factor * torch.exp2(2-e_sf) + torch.rand_like(e_sf)) * torch.exp2(e_sf-2)
+        
+        rec_sf = (1.0 / scale_factor).to(torch.bfloat16).to(x.dtype)
+        scale_lv2 = (max_lv2 * rec_sf)
+        scale_lv2 = torch.exp2((scale_lv2.clip(0, 4) / 4).floor())
+        scale_lv3 = torch.exp2(((max_lv3 * rec_sf / scale_lv2).clip(0, 2) / 2).floor())
+        
+        return scale_lv2 * scale_lv3 / rec_sf
+    
+    @classmethod
+    @torch.no_grad()
+    def quant(cls, x: torch.Tensor, s: torch.Tensor):
         xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)
-        s_fp8  = s4.to(torch.float8_e4m3fn).to(torch.float32)
-        return (x4 * s_fp8).view(xshape)
-
-
-
-
-
-class Cast2LNS4SRFP32(BlockQuantFunc):
-    """
-    LNS4 (4-bit) fake-quantization (QDQ style):
-      - Linear-domain STOCHASTIC rounding onto {0} ∪ {±2^(k-bias), k=1..7}
-      - Block-wise scaling controlled by *global* BlockQuantFunc.block_shape
-      - rquant() multiplies FP32 scale directly (NO FP8 e4m3 roundtrip)
-    """
-    # 默认偏置，可外部修改：Cast2LNS4_QDQ.default_bias = 2/3/...
-    default_bias = 0
-
+        qdim = -1
+        man_bits = 3
+        x = x.reshape(-1, x.shape[-1])
+        x = x.unflatten(qdim, (-1, 8, 2, 4))
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+        
+        mant = x_unsigned / s        
+        q = 2**(man_bits - 1)
+        # mant = torch.floor(mant * 2**(man_bits - 1) + 0.5) / 2**(man_bits - 1)        
+        mant = torch.floor(mant * q + torch.rand_like(mant * q)) / q
+        mant[mant>=2] = 2 - 2**(-man_bits+1)
+        mant = sign * mant
+        mant = mant.flatten(qdim-3, qdim)
+        return  mant.view(xshape)#output of shape (dim1, (-1, 8, 2, 4))  
+    
     @classmethod
     @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        计算每块（或全局）的 scale 网格：
-          s_block = amax_block / 2^(7 - bias) + eps
-        将归一化 |x|/s 的“最大非零”对齐到 2^(7-bias)。
-        block_size 由全局 BlockQuantFunc.block_shape 控制。
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        # 摊成二维，按最后一维分块
-        x2 = x.reshape(-1, x.shape[-1])
-        rows, cols = x2.shape
-        brows, bcols = BlockQuantFunc.block_shape
-        assert (rows % brows == 0) and (cols % bcols == 0), "block_shape must divide input"
-
-        # 每块 absmax → [rows//brows, cols//bcols]
-        amax = (
-            x2.abs()
-              .view(rows // brows, brows, cols // bcols, bcols)
-              .amax(dim=(1, 3), keepdim=False)
-        )
-
-        # 上界对齐：LNS4 非零最大幂 2^(7-bias)
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s
-
+    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
+        return Cast2Hif4.rquant(x, s)
+    
+from Metis.hif4_gpu.quant_cy import QType, quant_dequant_float
+class Cast2Hif4_0418(QuantFunc):
     @classmethod
     @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        量化（QDQ 风格，返回仍为浮点）：
-          1) 归一化 a = |x|/s
-          2) 在线性域“随机舍入”到最近两幂（或 {0, 2^(1-bias)}）
-             - 小于最小非零：在 {0, min_nz} 间以 p=a/min_nz 概率上抬
-             - 中间区间：在 {rL, rU=2*rL} 间以 p=(a-rL)/(rU-rL) 概率上抬
-             - 超上界：饱和到 max_nz
-          3) 乘回符号，得到假量化浮点 q（仍 FP32，归一化域）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)  # s 广播到元素位
-        xsign  = x4.sign()
-        a      = (x4.abs() / s4).clamp(min=0.0)
-
-        # LNS4 网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零幂
-        max_nz = 2.0 ** (7 - bias)   # 最大非零幂
-
-        qmag = torch.zeros_like(a)
-
-        # 1) 0 < a < min_nz → 在 {0, min_nz} 间，p_up = a/min_nz
-        mask = (a > 0) & (a < min_nz)
-        if mask.any():
-            p = (a[mask] / min_nz).clamp(0.0, 1.0)
-            qmag[mask] = torch.where(torch.rand_like(p) < p, min_nz, 0.0)
-
-        # 2) min_nz ≤ a < max_nz → 在 {rL, rU=2*rL} 间，p_up = (a-rL)/(rU-rL)
-        mask = (a >= min_nz) & (a < max_nz)
-        if mask.any():
-            a2 = a[mask]
-            k  = torch.floor(torch.log2(a2))
-            rL = torch.pow(2.0, k)
-            rU = rL * 2.0
-            p  = ((a2 - rL) / (rU - rL)).clamp(0.0, 1.0)
-            qmag[mask] = torch.where(torch.rand_like(p) < p, rU, rL)
-
-        # 3) a ≥ max_nz → 饱和到 max_nz
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        q = (xsign * qmag).view(xshape)  # 假量化后的“浮点值”（仍在归一化域）
-        return q
-
+    def get_scalar(cls, x: torch.Tensor):
+        return x.new_ones(())
+    
     @classmethod
     @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 直接使用 FP32 的 s：x_hat = x * s
-          - 不再进行 FP8 e4m3 roundtrip（更贴近“FP32 scale 存取”的配置）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)
-        return (x4 * s4).view(xshape)
-
-
-
-class Cast2LNS4NSRFP32(BlockQuantFunc):
-    """
-    LNS4 (4-bit) fake-quantization (QDQ style):
-      - Linear-domain ROUND-TO-NEAREST onto {0} ∪ {±2^(k-bias), k=1..7}
-      - Block-wise scaling controlled by *global* BlockQuantFunc.block_shape
-      - rquant() multiplies FP32 scale directly (NO FP8 e4m3 roundtrip)
-    """
-    # 默认偏置，可外部随时改：Cast2LNS4_QDQ.default_bias = 0/2/3/...
-    default_bias = 3
-
+    def quant(cls, x: torch.Tensor, s: torch.Tensor):
+        return x
+    
     @classmethod
     @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        返回按块（或全局）计算的 scale 网格：
-          s_block = amax_block / 2^(7 - bias) + eps
-        说明：
-          - 归一化 |x|/s 后的可表示上界对齐到 2^(7-bias)
-          - block_size 由 BlockQuantFunc.block_shape 控制（可用于全局 / per-block）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        # 摊成二维，按最后一维分块
-        x2 = x.reshape(-1, x.shape[-1])
-        rows, cols = x2.shape
-        brows, bcols = BlockQuantFunc.block_shape
-        assert (rows % brows == 0) and (cols % bcols == 0), "block_shape must divide input"
-
-        # 每块 absmax → [rows//brows, cols//bcols]
-        amax = (
-            x2.abs()
-              .view(rows // brows, brows, cols // bcols, bcols)
-              .amax(dim=(1, 3), keepdim=False)
-        )
-
-        # 上界对齐：LNS4 非零最大幂 2^(7-bias)
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s
-
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        量化（QDQ 风格，返回仍为浮点）：
-          1) 归一化 a = |x|/s
-          2) 在线性域“就近四舍五入”到幂网格
-             - 0 < a < min_nz      : 与 {0, min_nz} 比较，阈值 min_nz/2
-             - min_nz ≤ a < max_nz : 与 {rL, rU=2*rL} 比较，阈值 (rL+rU)/2
-             - a ≥ max_nz          : 饱和到 max_nz
-          3) 乘回符号，得到假量化浮点 q（仍 FP32，归一化域）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)  # s 广播到元素位
-        xsign  = x4.sign()
-        a      = (x4.abs() / s4).clamp(min=0.0)
-
-        # LNS4 网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零：2^(1-bias)
-        max_nz = 2.0 ** (7 - bias)   # 最大非零：2^(7-bias)
-
-        qmag = torch.zeros_like(a)
-
-        # 1) 0 < a < min_nz：与 {0, min_nz} 比较，阈值 min_nz/2
-        mask1 = (a > 0) & (a < min_nz)
-        if mask1.any():
-            mid = 0.5 * min_nz
-            qmag[mask1] = torch.where(a[mask1] >= mid,
-                                      torch.full_like(a[mask1], min_nz),
-                                      torch.zeros_like(a[mask1]))
-
-        # 2) min_nz ≤ a < max_nz：找相邻幂 rL 与 rU=2*rL，阈值 (rL + rU)/2 = 1.5*rL
-        mask2 = (a >= min_nz) & (a < max_nz)
-        if mask2.any():
-            a2 = a[mask2]
-            k  = torch.floor(torch.log2(a2))
-            rL = torch.pow(2.0, k)                # 左端幂
-            rU = rL * 2.0                         # 右端幂
-            mid = 0.5 * (rL + rU)                 # 线性域中点
-            qmag[mask2] = torch.where(a2 >= mid, rU, rL)
-
-        # 3) a ≥ max_nz：饱和
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        q = (xsign * qmag).view(xshape)  # 假量化“浮点”（仍在归一化域）
-        return q
-
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 直接使用 FP32 的 s：x_hat = x * s
-          - 不进行 FP8 e4m3 roundtrip（更接近“scale 以 FP32 存取”的配置）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xshape = x.shape
-        x4, s4 = BlockQuantFunc._reshape(x, s)
-        return (x4 * s4).view(xshape)
-
-
-
-class Cast2LNS4_SR_GlobalFP8(QuantFunc):
-    """
-    LNS4 (4-bit) fake-quant (QDQ) with per-tensor/global scaling:
-      - Linear-domain STOCHASTIC rounding onto {0} ∪ {±2^(k-bias), k=1..7}
-      - ONE scale for the whole tensor (inherits QuantFunc)
-      - rquant() casts the scale s to FP8 e4m3 then back to FP32 before multiplying
-    """
-    # 默认偏置（可外部一行改：Cast2LNS4_QDQ_GlobalFP8.default_bias = 0/2/3/...）
-    default_bias = 3
-
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        Per-tensor/global scale:
-          s = abs(x).max() / 2^(7 - bias) + eps
-        返回标量（或 0-d 张量，能广播到整张量）
-        """
-        if bias is None:
-            bias = cls.default_bias
-        amax = x.abs().max()
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s
-
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        QDQ 量化（返回仍为浮点）：
-          1) a = |x| / s
-          2) 在线性域进行“随机舍入”到幂网格
-             - 0 < a < min_nz      : 在 {0, min_nz} 间以上抬概率 p=a/min_nz 抽签
-             - min_nz ≤ a < max_nz : 在 {rL, rU=2*rL} 间以上抬概率 p=(a-rL)/(rU-rL) 抽签
-             - a ≥ max_nz          : 饱和到 max_nz
-          3) 乘回符号，得到假量化浮点 q（仍在归一化域）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xsign = x.sign()
-        a = (x.abs() / s).clamp(min=0.0)
-
-        # LNS4 幂网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零：2^(1-bias)
-        max_nz = 2.0 ** (7 - bias)   # 最大非零：2^(7-bias)
-
-        qmag = torch.zeros_like(a)
-
-        # 1) 0 < a < min_nz → 在 {0, min_nz} 之间，p_up = a / min_nz
-        mask = (a > 0) & (a < min_nz)
-        if mask.any():
-            p = (a[mask] / min_nz).clamp(0.0, 1.0)
-            qmag[mask] = torch.where(torch.rand_like(p) < p, min_nz, 0.0)
-
-        # 2) min_nz ≤ a < max_nz → 在 {rL, rU=2*rL} 之间，p_up = (a-rL)/(rU-rL)
-        mask = (a >= min_nz) & (a < max_nz)
-        if mask.any():
-            a2 = a[mask]
-            k  = torch.floor(torch.log2(a2))   # 左端幂指数
-            rL = torch.pow(2.0, k)            # 左端幂
-            rU = rL * 2.0                     # 右端幂
-            p  = ((a2 - rL) / (rU - rL)).clamp(0.0, 1.0)
-            qmag[mask] = torch.where(torch.rand_like(p) < p, rU, rL)
-
-        # 3) a ≥ max_nz → 饱和到最大幂
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        # 乘回符号（仍是“假量化浮点”，尚未乘回 s）
-        q = xsign * qmag
-        return q
-
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 先把 s cast 到 FP8 e4m3 再回 FP32（模拟 scale 的低精读回）
-          - 再乘回：x_hat = x * s_fp8
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        s_fp8 = s.to(torch.float8_e4m3fn).to(torch.float32)
-        return x * s_fp8
-
-
-
-class Cast2LNS4_NSR_GlobalFP8(QuantFunc):
-    """
-    LNS4 (4-bit) fake-quant (QDQ) with per-tensor/global scaling:
-      - Linear-domain ROUND-TO-NEAREST onto {0} ∪ {±2^(k-bias), k=1..7}
-      - ONE scale for the whole tensor (inherits QuantFunc)
-      - rquant() casts the scale s to FP8 e4m3 then back to FP32 before multiplying
-    """
-    # 默认偏置，可外部一行改：Cast2LNS4_QDQ_GlobalFP8.default_bias = 0/2/3/...
-    default_bias = 3
-
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        Per-tensor/global scale:
-          s = abs(x).max() / 2^(7 - bias) + eps
-        返回标量（或 0-d 张量，能广播到整张量）
-        """
-        if bias is None:
-            bias = cls.default_bias
-        amax = x.abs().max()
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s
-
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        QDQ 量化（返回仍为浮点）：
-          1) a = |x| / s
-          2) 在线性域“就近四舍五入”到幂网格
-             - 0 < a < min_nz      : 与 {0, min_nz} 比较，阈值 min_nz/2
-             - min_nz ≤ a < max_nz : 与 {rL, rU=2*rL} 比较，阈值 (rL+rU)/2
-             - a ≥ max_nz          : 饱和到 max_nz
-          3) 乘回符号，得到假量化浮点 q（仍在归一化域）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xsign = x.sign()
-        a = (x.abs() / s).clamp(min=0.0)
-
-        # LNS4 幂网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零：2^(1-bias)
-        max_nz = 2.0 ** (7 - bias)   # 最大非零：2^(7-bias)
-
-        qmag = torch.zeros_like(a)
-
-        # 1) 0 < a < min_nz：与 {0, min_nz} 比较，阈值 min_nz/2
-        mask1 = (a > 0) & (a < min_nz)
-        if mask1.any():
-            mid = 0.5 * min_nz
-            qmag[mask1] = torch.where(
-                a[mask1] >= mid,
-                torch.full_like(a[mask1], min_nz),
-                torch.zeros_like(a[mask1])
-            )
-
-        # 2) min_nz ≤ a < max_nz：找相邻幂 rL 与 rU=2*rL，阈值 (rL + rU)/2
-        mask2 = (a >= min_nz) & (a < max_nz)
-        if mask2.any():
-            a2 = a[mask2]
-            k  = torch.floor(torch.log2(a2))   # 左端幂指数
-            rL = torch.pow(2.0, k)            # 左端幂
-            rU = rL * 2.0                     # 右端幂
-            mid = 0.5 * (rL + rU)             # 线性域中点
-            qmag[mask2] = torch.where(a2 >= mid, rU, rL)
-
-        # 3) a ≥ max_nz → 饱和到最大幂
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        # 乘回符号（仍是“假量化浮点”，尚未乘回 s）
-        q = xsign * qmag
-        return q
-
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 先把 s cast 到 FP8 e4m3 再回 FP32（模拟 scale 的低精读回）
-          - 再乘回：x_hat = x * s_fp8
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        s_fp8 = s.to(torch.float8_e4m3fn).to(torch.float32)
-        return x * s_fp8
-
-
-
-class Cast2LNS4_QDQ_GlobalFP32(QuantFunc):
-    """
-    LNS4 (4-bit) fake-quant (QDQ) with per-tensor/global scaling:
-      - Linear-domain STOCHASTIC rounding onto {0} ∪ {±2^(k-bias), k=1..7}
-      - ONE scale for the whole tensor (inherits QuantFunc ➜ per-tensor scaling)
-      - rquant() multiplies FP32 scale directly (NO FP8 e4m3 roundtrip)
-    """
-    # 默认偏置；可在外部一行修改：Cast2LNS4_QDQ_GlobalFP32.default_bias = 0/2/3/...
-    default_bias = 0
-
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        Per-tensor/global scale:
-          s = abs(x).max() / 2^(7 - bias) + eps
-        返回标量（或 0-d 张量），可广播到整张量。
-        """
-        if bias is None:
-            bias = cls.default_bias
-        amax = x.abs().max()
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s  # ★ per-tensor：整个张量一个 s
-
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        QDQ 量化（返回仍为浮点）：
-          1) a = |x| / s
-          2) 在线性域随机舍入到幂网格（无偏抽签）
-             - 0 < a < min_nz      : 在 {0, min_nz} 间，p_up = a/min_nz
-             - min_nz ≤ a < max_nz : 在 {rL, rU=2*rL} 间，p_up = (a-rL)/(rU-rL)
-             - a ≥ max_nz          : 饱和到 max_nz
-          3) 乘回符号，得到假量化浮点 q（仍在归一化域）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xsign = x.sign()
-        a = (x.abs() / s).clamp(min=0.0)
-
-        # LNS4 网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零：2^(1-bias)
-        max_nz = 2.0 ** (7 - bias)   # 最大非零：2^(7-bias)
-
-        qmag = torch.zeros_like(a)
-
-        # 1) 0 < a < min_nz → {0, min_nz}，p_up = a/min_nz
-        mask = (a > 0) & (a < min_nz)
-        if mask.any():
-            p = (a[mask] / min_nz).clamp(0.0, 1.0)
-            qmag[mask] = torch.where(torch.rand_like(p) < p, min_nz, 0.0)
-
-        # 2) min_nz ≤ a < max_nz → {rL, rU=2*rL}，p_up = (a-rL)/(rU-rL)
-        mask = (a >= min_nz) & (a < max_nz)
-        if mask.any():
-            a2 = a[mask]
-            k  = torch.floor(torch.log2(a2))   # 左端幂指数
-            rL = torch.pow(2.0, k)            # 左端幂
-            rU = rL * 2.0                     # 右端幂
-            p  = ((a2 - rL) / (rU - rL)).clamp(0.0, 1.0)
-            qmag[mask] = torch.where(torch.rand_like(p) < p, rU, rL)
-
-        # 3) a ≥ max_nz → 饱和
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        q = xsign * qmag  # 假量化浮点（仍在归一化域）
-        return q
-
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 直接使用 FP32 的 scale：x_hat = x * s
-          - 不进行 FP8 e4m3 roundtrip
-        """
-        if bias is None:
-            bias = cls.default_bias
-        return x * s
-
-
-
-class Cast2LNS4_QDQ_GlobalFP32_RTN(QuantFunc):
-    """
-    LNS4 (4-bit) fake-quant (QDQ) with per-tensor/global scaling:
-      - Linear-domain ROUND-TO-NEAREST onto {0} ∪ {±2^(k-bias), k=1..7}
-      - ONE scale for the whole tensor (inherits QuantFunc ⇒ per-tensor scaling)
-      - rquant() multiplies FP32 scale directly (NO FP8 e4m3 roundtrip)
-    """
-    # 默认偏置；可在外部一行修改：Cast2LNS4_QDQ_GlobalFP32_RTN.default_bias = 0/2/3/...
-    default_bias = 0
-
-    @classmethod
-    @torch.no_grad()
-    def get_scalar(cls, x: torch.Tensor, bias: int | None = None):
-        """
-        Per-tensor/global scale:
-          s = abs(x).max() / 2^(7 - bias) + eps
-        返回标量（或 0-d 张量），可广播到整张量。
-        """
-        if bias is None:
-            bias = cls.default_bias
-        amax = x.abs().max()
-        max_nonzero = 2.0 ** (7 - bias)
-        s = (amax / max_nonzero + 1e-9).to(torch.float32)
-        return s  # ★ per-tensor：整个张量一个 s
-
-    @classmethod
-    @torch.no_grad()
-    def quant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        QDQ 量化（返回仍为浮点）：
-          1) a = |x| / s
-          2) 在线性域“就近四舍五入”到幂网格（确定性）
-             - 0 < a < min_nz      : 与 {0, min_nz} 比较，阈值 min_nz/2
-             - min_nz ≤ a < max_nz : 与 {rL, rU=2*rL} 比较，阈值 (rL+rU)/2
-             - a ≥ max_nz          : 饱和到 max_nz
-          3) 乘回符号，得到假量化浮点 q（仍在归一化域）
-        """
-        if bias is None:
-            bias = cls.default_bias
-
-        xsign = x.sign()
-        a = (x.abs() / s).clamp(min=0.0)
-
-        # LNS4 幂网格（归一化域）
-        min_nz = 2.0 ** (1 - bias)   # 最小非零：2^(1-bias)
-        max_nz = 2.0 ** (7 - bias)   # 最大非零：2^(7-bias)
-
-        qmag = torch.zeros_like(a)
-
-        # 1) 0 < a < min_nz：与 {0, min_nz} 比较，阈值 min_nz/2
-        mask1 = (a > 0) & (a < min_nz)
-        if mask1.any():
-            mid = 0.5 * min_nz
-            qmag[mask1] = torch.where(
-                a[mask1] >= mid,
-                torch.full_like(a[mask1], min_nz),
-                torch.zeros_like(a[mask1])
-            )
-
-        # 2) min_nz ≤ a < max_nz：找相邻幂 rL 与 rU=2*rL，阈值 (rL + rU)/2
-        mask2 = (a >= min_nz) & (a < max_nz)
-        if mask2.any():
-            a2 = a[mask2]
-            k  = torch.floor(torch.log2(a2))   # 左端幂指数
-            rL = torch.pow(2.0, k)            # 左端幂
-            rU = rL * 2.0                     # 右端幂
-            mid = 0.5 * (rL + rU)             # 线性域中点
-            qmag[mask2] = torch.where(a2 >= mid, rU, rL)
-
-        # 3) a ≥ max_nz → 饱和到最大幂
-        qmag = torch.where(a >= max_nz, torch.full_like(a, max_nz), qmag)
-
-        # 乘回符号（仍是“假量化浮点”，尚未乘回 s）
-        q = xsign * qmag
-        return q
-
-    @classmethod
-    @torch.no_grad()
-    def rquant(cls, x: torch.Tensor, s: torch.Tensor, bias: int | None = None):
-        """
-        反量化（回实数域）：
-          - 直接使用 FP32 的 s：x_hat = x * s
-          - 不进行 FP8 e4m3 roundtrip
-        """
-        if bias is None:
-            bias = cls.default_bias
-        return x * s
-
-# --------------------------------LNS结束-----------------------------------
-
-
-
-
-
+    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
+        # import inspect
+        # print("quant_dequant_float module =", quant_dequant_float.__module__)
+        # print("quant_dequant_float file   =", inspect.getfile(quant_dequant_float))
+        # print("QType file                 =", inspect.getfile(QType))
+        # print("quant_dequant_float src:")
+        # print(inspect.getsource(quant_dequant_float)[:400])
+        quant_type = QType("hifx4").dim(-1)
+        # print("before qdq")
+        # y = quant_dequant_float(x, quant_type, force_py=True, force_fp32=True)
+        y = quant_dequant_float(x.cuda(), quant_type, force_py=False)
+        # print("after qdq")
+        return y
 
 
 quant_func = {
@@ -1199,31 +583,48 @@ quant_func = {
     "mxfp4e2m1b": Cast2MXFp4e2m1Block,    
     "mxfp4e2m1bnosr": Cast2MXFp4e2m1BlockNOSR,
     "nvfp4e2m1bnosr": Cast2NVFp4e2m1BlockNOSR,
+    "hif4": Cast2Hif4,
+    "hif4sr": Cast2Hif4SR,
+    "hif4ssr": Cast2Hif4SSR,
     "fp6e3m2": Cast2Fp6e3m2,
     "fp6e3m2b": Cast2Fp6e3m2Block,
     "fp8e4m3": Cast2Fp8e4m3,
     "fp8e4m3b": Cast2Fp8e4m3Block,
     "fp32": Cast2Fp32,
     "1p58bit": WeightQuant,
-    "lns4sre4m3": Cast2LNS4_QDQ,
-    "lns4nsre4m3": Cast2LNS4_nsr,
-    "lns4srfp32": Cast2LNS4SRFP32,
-    "lns4nsrfp32": Cast2LNS4NSRFP32,
-    "lns4srgfp8": Cast2LNS4_SR_GlobalFP8,
-    "lns4nsrgfp8": Cast2LNS4_NSR_GlobalFP8,
-    "lns4srgfp32": Cast2LNS4_QDQ_GlobalFP32,
-    "lns4nsrgfp32": Cast2LNS4_QDQ_GlobalFP32_RTN,
-
+    "hif4_0418": Cast2Hif4_0418,
 }
 
 
 
 if __name__ == "__main__":
-    x = torch.randn([1, 16])
+    x = torch.load("/inspire/hdd/project/yunweiyuhuifu/p-shangli/quant/gpt/visual_ckpt/baseline/warmup_linear_weight.pt")
+    print(x.shape)
+    x = x.view(-1, 2048)
+    # x = torch.randn([768, 768])
+    # u, s, v = torch.linalg.svd(x)
+    # s[0] *= 15
+    # s[1] *= 8
+    # s[2] *= 7
+    # s[4] *= 6
+    # x = u @ torch.diag(s) @ v
+    
     print(x)
-    s = Cast2Fp4e2m1Block.get_scalar(x)
-    qx = Cast2Fp4e2m1Block.quant(x, s)
-    qx = Cast2Fp4e2m1Block.rquant(qx, s)
+    s = Cast2NVFp4e2m1BlockNOSR.get_scalar(x)
+    qx = Cast2NVFp4e2m1BlockNOSR.quant(x, s)
+    qx = Cast2NVFp4e2m1BlockNOSR.rquant(qx, s)
+    
 
-    print(qx)
+    print((x - qx) / x.norm())
+    me = x.mean(dim=0).repeat(1, x.shape[0]).view(x.shape[0], -1)
+    me *= x.mean(dim=1, keepdim=True) 
+    # me = x.mean(dim=0, keepdim=True).repeat(x.shape[0])
+    x1 = x - me
+    s = Cast2NVFp4e2m1BlockNOSR.get_scalar(x1)
+    qx1 = Cast2NVFp4e2m1BlockNOSR.quant(x1, s)
+    qx1 = Cast2NVFp4e2m1BlockNOSR.rquant(qx1, s)
+    
+    qx1 += me
+
+    print((x - qx1).norm() / (x).norm())    
     # print(qx / s)
