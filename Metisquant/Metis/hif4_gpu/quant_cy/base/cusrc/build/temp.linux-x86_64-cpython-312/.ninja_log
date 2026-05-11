@@ -1,0 +1,5 @@
+# ninja log v5
+3	18864	1776757053358642768	/inspire/hdd/project/yunweiyuhuifu/p-shangli/cmy/Metis-Hif4/Metis/hif4_gpu/quant_cy/base/cusrc/build/temp.linux-x86_64-cpython-312/hifxg_quant.o	b66f3a0e321d7ff1
+3	76759	1776757111247735644	/inspire/hdd/project/yunweiyuhuifu/p-shangli/cmy/Metis-Hif4/Metis/hif4_gpu/quant_cy/base/cusrc/build/temp.linux-x86_64-cpython-312/hifxg_quant_cuda.o	28e74c4177454fd9
+10	17829	1776757129458536779	/inspire/hdd/project/yunweiyuhuifu/p-shangli/cmy/Metis-Hif4/Metis/hif4_gpu/quant_cy/base/cusrc/build/temp.linux-x86_64-cpython-312/lowbit_quant.o	168b952ab4f3d6d1
+10	73721	1776757185346467877	/inspire/hdd/project/yunweiyuhuifu/p-shangli/cmy/Metis-Hif4/Metis/hif4_gpu/quant_cy/base/cusrc/build/temp.linux-x86_64-cpython-312/lowbit_quant_cuda.o	2358fc189b447005
