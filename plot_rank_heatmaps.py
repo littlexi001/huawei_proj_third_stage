@@ -65,6 +65,17 @@ def extract_acc_from_log(log_path: Path):
         return None
 
 
+def extract_acc_from_summary(summary_path: Path):
+    if not summary_path.exists():
+        return None
+    try:
+        obj = json.loads(summary_path.read_text(encoding="utf-8"))
+        return float(obj["overall_acc"])
+    except Exception as exc:
+        print(f"[WARN] failed to parse summary {summary_path}: {exc}")
+        return None
+
+
 def collect_results(root: Path):
     pattern = re.compile(r"wrank_(\d+)_xrank_(\d+)")
     results = {}
@@ -78,14 +89,13 @@ def collect_results(root: Path):
 
         wr = int(m.group(1))
         xr = int(m.group(2))
+        summary_path = sub / "summary.json"
         log_path = sub / "worker.log"
-        if not log_path.exists():
-            print(f"[WARN] missing log: {log_path}")
-            continue
-
-        acc = extract_acc_from_log(log_path)
+        acc = extract_acc_from_summary(summary_path)
+        if acc is None and log_path.exists():
+            acc = extract_acc_from_log(log_path)
         if acc is None:
-            print(f"[WARN] failed to parse overall_acc from: {log_path}")
+            print(f"[WARN] failed to parse overall_acc from: {summary_path} or {log_path}")
             continue
 
         results[(wr, xr)] = acc

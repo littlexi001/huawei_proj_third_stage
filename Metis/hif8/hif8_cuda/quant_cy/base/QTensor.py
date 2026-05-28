@@ -29,10 +29,16 @@ QFUNC_MAP: Tuple[Tuple[str, Callable], ...] = ((r'^hifx[0-9]*$', quant_hifx),
 if hifxg_quant is None:
     CUDA_KERNELS = ()
 else:
-    CUDA_KERNELS: Tuple[Tuple[str, CUDA_FUNC_BUNDLE_T], ...] = (
-                (r'^hifx[0-9]*$', (hifxg_quant.hifx_quant, hifxg_quant.hifx_quant_bf16, None)),
-                (r'^hif8$', (hifxg_quant.hif8_quant, hifxg_quant.hif8_quant_bf16, hifxg_quant.hif8_quant_fp16)),
-            )
+    cuda_kernels = []
+    if all(hasattr(hifxg_quant, name) for name in ("hifx_quant", "hifx_quant_bf16")):
+        cuda_kernels.append(
+            (r'^hifx[0-9]*$', (hifxg_quant.hifx_quant, hifxg_quant.hifx_quant_bf16, None))
+        )
+    if all(hasattr(hifxg_quant, name) for name in ("hif8_quant", "hif8_quant_bf16", "hif8_quant_fp16")):
+        cuda_kernels.append(
+            (r'^hif8$', (hifxg_quant.hif8_quant, hifxg_quant.hif8_quant_bf16, hifxg_quant.hif8_quant_fp16))
+        )
+    CUDA_KERNELS: Tuple[Tuple[str, CUDA_FUNC_BUNDLE_T], ...] = tuple(cuda_kernels)
 
 
 # cuda quant function generator 
