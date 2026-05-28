@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_PATH="../../models/Qwen3-0.6B"
-OUTPUT_DIR="./outputs/qwen3_svd_resid_nvfp4_mmlu_grid_fixed"
+MODEL_PATH="/mnt/workspace/Qwen3-8B"
+OUTPUT_DIR="./outputs/qwen3_svd_resid_nvfp4_mmlu_grid_8B_nvfp8"
 SCRIPT="qwen3_svd_residual_nvfp4_mmlu.py"
 
-# 可选：如果 Metis 不在当前环境路径里，取消下一行注释并改成你的项目路径
+# If Metis is not importable, uncomment and set this to your project path.
 # export PYTHONPATH=/mnt/workspace/your_project:${PYTHONPATH}
 # source /path/to/venv/bin/activate
 
@@ -18,7 +18,8 @@ nohup python "${SCRIPT}" \
   --gpu_ids "0,1,2,3,4,5,6,7" \
   --rank_grid "0,5,10,15,20,25,30,40,50,60,80,100" \
   --run_unquantized_baseline \
-  --qtype "nvfp4e2m1bnosr" \
+  --qtype "fp8e4m3b" \
+  --blocksize 16 \
   --q_scalar_w 1.0 \
   --q_scalar_x 1.0 \
   --svd_method_w randomized \

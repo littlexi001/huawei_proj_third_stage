@@ -61,12 +61,24 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # Metis quant
 # =========================
 try:
-    from Metis.quant import quant_func
+    from Metis.quant import BlockQuantFunc, quant_func
 except Exception as e:
+    BlockQuantFunc = None
     quant_func = None
     _METIS_IMPORT_ERROR = repr(e)
 else:
     _METIS_IMPORT_ERROR = None
+
+
+def set_quant_blocksize(blocksize: int) -> None:
+    if BlockQuantFunc is None:
+        raise ImportError(
+            "Failed to import Metis.quant.BlockQuantFunc. "
+            f"Original error: {_METIS_IMPORT_ERROR}"
+        )
+    if blocksize <= 0:
+        raise ValueError(f"blocksize must be positive, got {blocksize}")
+    BlockQuantFunc.block_shape = (1, int(blocksize))
 
 
 def quant_tensor(x: torch.Tensor, qtype: str, q_scalar: float = 1.0) -> torch.Tensor:
@@ -520,6 +532,7 @@ class EvalConfig:
     weight_rank: int
     act_rank: int
     qtype: str = "nvfp4e2m1bnosr"
+    blocksize: int = 16
     q_scalar_w: float = 1.0
     q_scalar_x: float = 1.0
     svd_method_w: str = "randomized"
@@ -555,6 +568,7 @@ def evaluate_mmlu(cfg: EvalConfig) -> Dict[str, Any]:
     if cfg.no_quant:
         replaced = []
     else:
+        set_quant_blocksize(cfg.blocksize)
         replaced = patch_model_linears(
             model=model,
             weight_rank=cfg.weight_rank,
@@ -707,6 +721,7 @@ def spawn_one_worker(
         "--weight_rank", str(weight_rank),
         "--act_rank", str(act_rank),
         "--qtype", base_args.qtype,
+        "--blocksize", str(base_args.blocksize),
         "--q_scalar_w", str(base_args.q_scalar_w),
         "--q_scalar_x", str(base_args.q_scalar_x),
         "--svd_method_w", base_args.svd_method_w,
@@ -852,6 +867,7 @@ def build_parser():
     p.add_argument("--model_path", type=str, required=True)
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--qtype", type=str, default="nvfp4e2m1bnosr")
+    p.add_argument("--blocksize", type=int, default=16)
     p.add_argument("--q_scalar_w", type=float, default=1.0)
     p.add_argument("--q_scalar_x", type=float, default=1.0)
     p.add_argument("--svd_method_w", type=str, default="randomized", choices=["full", "randomized"])
@@ -892,6 +908,7 @@ def main():
         weight_rank=args.weight_rank,
         act_rank=args.act_rank,
         qtype=args.qtype,
+        blocksize=args.blocksize,
         q_scalar_w=args.q_scalar_w,
         q_scalar_x=args.q_scalar_x,
         svd_method_w=args.svd_method_w,
@@ -914,6 +931,7 @@ def main():
         "total_count": result["total_count"],
         "weight_rank": cfg.weight_rank,
         "act_rank": cfg.act_rank,
+        "blocksize": cfg.blocksize,
         "no_quant": cfg.no_quant,
     }, ensure_ascii=False, indent=2))
 

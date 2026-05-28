@@ -577,6 +577,26 @@ class Cast2Hif4_0418(QuantFunc):
         return y
 
 
+class Cast2Hif8_CUDA(QuantFunc):
+    @classmethod
+    @torch.no_grad()
+    def get_scalar(cls, x: torch.Tensor):
+        return x.new_ones(())
+
+    @classmethod
+    @torch.no_grad()
+    def quant(cls, x: torch.Tensor, s: torch.Tensor):
+        return x
+
+    @classmethod
+    @torch.no_grad()
+    def rquant(cls, x: torch.Tensor, s: torch.Tensor):
+        from Metis.hif8.hif8_cuda.quant_cy import QType, quant_dequant_float
+
+        quant_type = QType("hif8").dim(0)
+        return quant_dequant_float(x.cuda(), quant_type, force_py=False)
+
+
 quant_func = {
     "fp4e2m1": Cast2Fp4e2m1,
     "nvfp4e2m1b": Cast2NVFp4e2m1Block,
@@ -593,6 +613,7 @@ quant_func = {
     "fp32": Cast2Fp32,
     "1p58bit": WeightQuant,
     "hif4_0418": Cast2Hif4_0418,
+    "hif8_cuda": Cast2Hif8_CUDA,
 }
 
 
