@@ -44,6 +44,9 @@ class EvalConfig:
     text_path: str
     output_dir: str
     formats: List[str]
+    rank_grid: List[int]
+    svd_method_w: str
+    svd_method_x: str
     max_samples: int
     max_length: int
     batch_size: int
@@ -93,6 +96,49 @@ def quant_tensor(x: torch.Tensor, qtype: str, q_scalar: float) -> torch.Tensor:
     return qcls.rquant(qcls.quant(x_fp, s), s)
 
 
+def parse_rank_grid(s: str) -> List[int]:
+    ranks = [int(x.strip()) for x in s.split(",") if x.strip()]
+    if not ranks:
+        raise ValueError("rank_grid is empty")
+    if any(x < 0 for x in ranks):
+        raise ValueError(f"rank_grid contains negative rank: {ranks}")
+    return ranks
+
+
+def _full_svd_lowrank(x2d: torch.Tensor, rank: int) -> torch.Tensor:
+    x32 = x2d.float().contiguous()
+    u, s, vh = torch.linalg.svd(x32, full_matrices=False)
+    r = min(rank, s.numel())
+    if r <= 0:
+        return torch.zeros_like(x32)
+    return (u[:, :r] * s[:r]) @ vh[:r, :]
+
+
+def _randomized_svd_lowrank(x2d: torch.Tensor, rank: int, niter: int = 2) -> torch.Tensor:
+    x32 = x2d.float().contiguous()
+    r = min(rank, min(x32.shape))
+    if r <= 0:
+        return torch.zeros_like(x32)
+    if r >= min(x32.shape):
+        return x32.clone()
+    u, s, v = torch.svd_lowrank(x32, q=r, niter=niter)
+    return (u[:, :r] * s[:r]) @ v[:, :r].T
+
+
+@torch.no_grad()
+def low_rank_approx(x2d: torch.Tensor, rank: int, method: str) -> torch.Tensor:
+    r = min(int(rank), min(x2d.shape))
+    if r <= 0:
+        return torch.zeros_like(x2d.float())
+    if r >= min(x2d.shape):
+        return x2d.float().contiguous().clone()
+    if method == "full":
+        return _full_svd_lowrank(x2d, r)
+    if method == "randomized":
+        return _randomized_svd_lowrank(x2d, r)
+    raise ValueError(f"Unknown SVD method: {method}")
+
+
 def get_parent_module(root: nn.Module, module_name: str) -> Tuple[nn.Module, str]:
     parts = module_name.split(".")
     parent = root
@@ -131,12 +177,97 @@ class PureQuantLinear(nn.Module):
         return F.linear(xq, wq, bias)
 
 
+class SVDRQuantLinear(nn.Module):
+    def __init__(
+        self,
+        base_linear: nn.Linear,
+        weight_rank: int,
+        act_rank: int,
+        qtype: str,
+        q_scalar_w: float,
+        q_scalar_x: float,
+        svd_method_w: str,
+        svd_method_x: str,
+        compute_dtype: torch.dtype,
+        store_dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.weight_rank = int(weight_rank)
+        self.act_rank = int(act_rank)
+        self.qtype = qtype
+        self.q_scalar_x = float(q_scalar_x)
+        self.svd_method_x = svd_method_x
+        self.compute_dtype = compute_dtype
+
+        device = base_linear.weight.device
+        w_fp = base_linear.weight.detach().float()
+        if self.weight_rank <= 0:
+            w_m = torch.zeros_like(w_fp)
+            w_r = w_fp
+        elif self.weight_rank >= min(w_fp.shape):
+            w_m = w_fp
+            w_r = torch.zeros_like(w_fp)
+        else:
+            w_m = low_rank_approx(w_fp, self.weight_rank, svd_method_w)
+            w_r = w_fp - w_m
+
+        w_mq = quant_tensor(w_m, qtype, q_scalar_w)
+        w_rq = quant_tensor(w_r, qtype, q_scalar_w)
+        self.register_buffer("weight_main", w_m.to(dtype=store_dtype, device=device), persistent=True)
+        self.register_buffer("weight_main_q", w_mq.to(dtype=store_dtype, device=device), persistent=True)
+        self.register_buffer("weight_resid_q", w_rq.to(dtype=store_dtype, device=device), persistent=True)
+        if base_linear.bias is None:
+            self.bias = None
+        else:
+            self.register_buffer("bias", base_linear.bias.detach().to(dtype=store_dtype, device=device), persistent=True)
+
+    @torch.no_grad()
+    def _decompose_activation(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        orig_shape = x.shape
+        hidden = orig_shape[-1]
+        x_fp = x.reshape(-1, hidden).float()
+        if self.act_rank <= 0:
+            x_m = torch.zeros_like(x_fp)
+            x_r = x_fp
+        elif self.act_rank >= min(x_fp.shape):
+            x_m = x_fp
+            x_r = torch.zeros_like(x_fp)
+        else:
+            x_m = low_rank_approx(x_fp, self.act_rank, self.svd_method_x)
+            x_r = x_fp - x_m
+
+        x_mq = quant_tensor(x_m, self.qtype, self.q_scalar_x)
+        x_rq = quant_tensor(x_r, self.qtype, self.q_scalar_x)
+        return (
+            x_m.reshape(orig_shape).to(dtype=self.compute_dtype),
+            x_mq.reshape(orig_shape).to(dtype=self.compute_dtype),
+            x_rq.reshape(orig_shape).to(dtype=self.compute_dtype),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_m, x_mq, x_rq = self._decompose_activation(x)
+        w_m = self.weight_main.to(dtype=self.compute_dtype)
+        w_mq = self.weight_main_q.to(dtype=self.compute_dtype)
+        w_rq = self.weight_resid_q.to(dtype=self.compute_dtype)
+        bias = self.bias.to(dtype=self.compute_dtype) if self.bias is not None else None
+
+        out = F.linear(x_m, w_m, bias)
+        out = out + F.linear(x_mq, w_rq, None)
+        out = out + F.linear(x_rq, w_mq, None)
+        out = out + F.linear(x_rq, w_rq, None)
+        return out
+
+
 def patch_model_linears(
     model: nn.Module,
     qtype: str,
     blocksize: int,
+    weight_rank: int,
+    act_rank: int,
     q_scalar_w: float,
     q_scalar_x: float,
+    svd_method_w: str,
+    svd_method_x: str,
     compute_dtype: torch.dtype,
     store_dtype: torch.dtype,
 ) -> List[str]:
@@ -151,7 +282,18 @@ def patch_model_linears(
         setattr(
             parent,
             child_name,
-            PureQuantLinear(module, qtype, q_scalar_w, q_scalar_x, compute_dtype, store_dtype),
+            SVDRQuantLinear(
+                module,
+                weight_rank,
+                act_rank,
+                qtype,
+                q_scalar_w,
+                q_scalar_x,
+                svd_method_w,
+                svd_method_x,
+                compute_dtype,
+                store_dtype,
+            ),
         )
         replaced.append(module_name)
     return replaced
@@ -274,6 +416,8 @@ def write_csv(path: str, results: Dict[str, Dict[str, float]]) -> None:
         "format",
         "qtype",
         "blocksize",
+        "weight_rank",
+        "act_rank",
         "mse",
         "rmse",
         "relative_mse",
@@ -284,8 +428,8 @@ def write_csv(path: str, results: Dict[str, Dict[str, float]]) -> None:
     ]
     with open(path, "w", encoding="utf-8") as f:
         f.write(",".join(fields) + "\n")
-        for fmt, row in results.items():
-            vals = [str(row.get(field, fmt if field == "format" else "")) for field in fields]
+        for key, row in results.items():
+            vals = [str(row.get(field, key if field == "format" else "")) for field in fields]
             f.write(",".join(vals) + "\n")
 
 
@@ -295,6 +439,9 @@ def main() -> None:
     parser.add_argument("--text_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="./outputs/final_hidden_mse")
     parser.add_argument("--formats", type=str, default="nvfp4,nvfp8,mxfp4,mxfp8,hif4,hif8")
+    parser.add_argument("--rank_grid", type=str, default="0,5,10,15,20,25,30,40,50,60,80,100")
+    parser.add_argument("--svd_method_w", type=str, default="randomized", choices=["full", "randomized"])
+    parser.add_argument("--svd_method_x", type=str, default="randomized", choices=["full", "randomized"])
     parser.add_argument("--max_samples", type=int, default=32)
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -305,6 +452,7 @@ def main() -> None:
     parser.add_argument("--q_scalar_x", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--trust_remote_code", action="store_true", default=True)
     args = parser.parse_args()
 
@@ -312,12 +460,16 @@ def main() -> None:
     unknown = [x for x in formats if x not in FORMAT_CONFIGS]
     if unknown:
         raise KeyError(f"Unknown formats: {unknown}. Available: {list(FORMAT_CONFIGS)}")
+    rank_grid = parse_rank_grid(args.rank_grid)
 
     cfg = EvalConfig(
         model_path=args.model_path,
         text_path=args.text_path,
         output_dir=args.output_dir,
         formats=formats,
+        rank_grid=rank_grid,
+        svd_method_w=args.svd_method_w,
+        svd_method_x=args.svd_method_x,
         max_samples=args.max_samples,
         max_length=args.max_length,
         batch_size=args.batch_size,
@@ -362,36 +514,61 @@ def main() -> None:
     results = {}
     for fmt in formats:
         fmt_cfg = FORMAT_CONFIGS[fmt]
-        print(f"[INFO] evaluating {fmt}: qtype={fmt_cfg['qtype']} blocksize={fmt_cfg['blocksize']}")
-        model = load_model(cfg.model_path, compute_dtype, cfg.trust_remote_code).to(device).eval()
-        replaced = patch_model_linears(
-            model,
-            qtype=fmt_cfg["qtype"],
-            blocksize=fmt_cfg["blocksize"],
-            q_scalar_w=cfg.q_scalar_w,
-            q_scalar_x=cfg.q_scalar_x,
-            compute_dtype=compute_dtype,
-            store_dtype=store_dtype,
-        )
-        start = time.time()
-        cur_hidden = collect_last_hidden(model, batches, device, compute_dtype, fmt)
-        metrics = mse_against_reference(cur_hidden, ref_hidden)
-        metrics.update(
-            {
-                "format": fmt,
-                "qtype": fmt_cfg["qtype"],
-                "blocksize": fmt_cfg["blocksize"],
-                "patched_num_modules": len(replaced),
-                "elapsed_sec": time.time() - start,
-            }
-        )
-        results[fmt] = metrics
-        write_json(os.path.join(cfg.output_dir, f"{fmt}_summary.json"), metrics)
-        print(json.dumps(metrics, ensure_ascii=False, indent=2))
-        del model, cur_hidden
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        for weight_rank in rank_grid:
+            for act_rank in rank_grid:
+                key = f"{fmt}/wrank_{weight_rank}_xrank_{act_rank}"
+                out_dir = os.path.join(cfg.output_dir, fmt, f"wrank_{weight_rank}_xrank_{act_rank}")
+                summary_path = os.path.join(out_dir, "summary.json")
+                if os.path.exists(summary_path) and not args.overwrite:
+                    with open(summary_path, "r", encoding="utf-8") as f:
+                        results[key] = json.load(f)
+                    print(f"[SKIP] existing result: {summary_path}")
+                    write_json(os.path.join(cfg.output_dir, "summary.json"), {"config": asdict(cfg), "results": results})
+                    write_csv(os.path.join(cfg.output_dir, "summary.csv"), results)
+                    continue
+
+                print(
+                    f"[INFO] evaluating {fmt}: qtype={fmt_cfg['qtype']} "
+                    f"blocksize={fmt_cfg['blocksize']} wrank={weight_rank} xrank={act_rank}"
+                )
+                model = load_model(cfg.model_path, compute_dtype, cfg.trust_remote_code).to(device).eval()
+                replaced = patch_model_linears(
+                    model,
+                    qtype=fmt_cfg["qtype"],
+                    blocksize=fmt_cfg["blocksize"],
+                    weight_rank=weight_rank,
+                    act_rank=act_rank,
+                    q_scalar_w=cfg.q_scalar_w,
+                    q_scalar_x=cfg.q_scalar_x,
+                    svd_method_w=cfg.svd_method_w,
+                    svd_method_x=cfg.svd_method_x,
+                    compute_dtype=compute_dtype,
+                    store_dtype=store_dtype,
+                )
+                start = time.time()
+                desc = f"{fmt} w={weight_rank} x={act_rank}"
+                cur_hidden = collect_last_hidden(model, batches, device, compute_dtype, desc)
+                metrics = mse_against_reference(cur_hidden, ref_hidden)
+                metrics.update(
+                    {
+                        "format": fmt,
+                        "qtype": fmt_cfg["qtype"],
+                        "blocksize": fmt_cfg["blocksize"],
+                        "weight_rank": weight_rank,
+                        "act_rank": act_rank,
+                        "patched_num_modules": len(replaced),
+                        "elapsed_sec": time.time() - start,
+                    }
+                )
+                results[key] = metrics
+                write_json(os.path.join(out_dir, "summary.json"), metrics)
+                write_json(os.path.join(cfg.output_dir, "summary.json"), {"config": asdict(cfg), "results": results})
+                write_csv(os.path.join(cfg.output_dir, "summary.csv"), results)
+                print(json.dumps(metrics, ensure_ascii=False, indent=2))
+                del model, cur_hidden
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     write_json(os.path.join(cfg.output_dir, "summary.json"), {"config": asdict(cfg), "results": results})
     write_csv(os.path.join(cfg.output_dir, "summary.csv"), results)
