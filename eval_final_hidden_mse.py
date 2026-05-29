@@ -86,6 +86,14 @@ def inference_autocast(device: torch.device, dtype: torch.dtype):
     return nullcontext()
 
 
+def disabled_autocast(device_type: str):
+    if device_type == "cuda" and hasattr(torch, "autocast"):
+        return torch.autocast(device_type="cuda", enabled=False)
+    from contextlib import nullcontext
+
+    return nullcontext()
+
+
 @torch.no_grad()
 def quant_tensor(x: torch.Tensor, qtype: str, q_scalar: float) -> torch.Tensor:
     if qtype not in quant_func:
@@ -106,37 +114,41 @@ def parse_rank_grid(s: str) -> List[int]:
 
 
 def _full_svd_lowrank(x2d: torch.Tensor, rank: int) -> torch.Tensor:
-    x32 = x2d.float().contiguous()
-    u, s, vh = torch.linalg.svd(x32, full_matrices=False)
-    r = min(rank, s.numel())
-    if r <= 0:
-        return torch.zeros_like(x32)
-    return (u[:, :r] * s[:r]) @ vh[:r, :]
+    with disabled_autocast(x2d.device.type):
+        x32 = x2d.float().contiguous()
+        u, s, vh = torch.linalg.svd(x32, full_matrices=False)
+        r = min(rank, s.numel())
+        if r <= 0:
+            return torch.zeros_like(x32)
+        return (u[:, :r] * s[:r]) @ vh[:r, :]
 
 
 def _randomized_svd_lowrank(x2d: torch.Tensor, rank: int, niter: int = 2) -> torch.Tensor:
-    x32 = x2d.float().contiguous()
-    r = min(rank, min(x32.shape))
-    if r <= 0:
-        return torch.zeros_like(x32)
-    if r >= min(x32.shape):
-        return x32.clone()
-    u, s, v = torch.svd_lowrank(x32, q=r, niter=niter)
-    return (u[:, :r] * s[:r]) @ v[:, :r].T
+    with disabled_autocast(x2d.device.type):
+        x32 = x2d.float().contiguous()
+        r = min(rank, min(x32.shape))
+        if r <= 0:
+            return torch.zeros_like(x32)
+        if r >= min(x32.shape):
+            return x32.clone()
+        u, s, v = torch.svd_lowrank(x32, q=r, niter=niter)
+        return (u[:, :r] * s[:r]) @ v[:, :r].T
 
 
 @torch.no_grad()
 def low_rank_approx(x2d: torch.Tensor, rank: int, method: str) -> torch.Tensor:
-    r = min(int(rank), min(x2d.shape))
-    if r <= 0:
-        return torch.zeros_like(x2d.float())
-    if r >= min(x2d.shape):
-        return x2d.float().contiguous().clone()
-    if method == "full":
-        return _full_svd_lowrank(x2d, r)
-    if method == "randomized":
-        return _randomized_svd_lowrank(x2d, r)
-    raise ValueError(f"Unknown SVD method: {method}")
+    with disabled_autocast(x2d.device.type):
+        x32 = x2d.float().contiguous()
+        r = min(int(rank), min(x32.shape))
+        if r <= 0:
+            return torch.zeros_like(x32)
+        if r >= min(x32.shape):
+            return x32.clone()
+        if method == "full":
+            return _full_svd_lowrank(x32, r)
+        if method == "randomized":
+            return _randomized_svd_lowrank(x32, r)
+        raise ValueError(f"Unknown SVD method: {method}")
 
 
 def get_parent_module(root: nn.Module, module_name: str) -> Tuple[nn.Module, str]:
