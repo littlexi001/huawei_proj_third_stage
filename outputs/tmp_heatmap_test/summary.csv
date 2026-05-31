@@ -1,0 +1,9 @@
+﻿format,qtype,blocksize,weight_rank,act_rank,mse,rmse,relative_mse,max_abs,num_values,patched_num_modules,elapsed_sec
+nvfp4,nvfp4e2m1bnosr,16,0,0,0.13,0.36,0.026,1,100,252,1
+nvfp4,nvfp4e2m1bnosr,16,0,5,0.10,0.32,0.020,1,100,252,1
+nvfp4,nvfp4e2m1bnosr,16,5,0,0.09,0.30,0.018,1,100,252,1
+nvfp4,nvfp4e2m1bnosr,16,5,5,0.07,0.26,0.014,1,100,252,1
+nvfp8,fp8e4m3b,16,0,0,0.008,0.09,0.0016,1,100,252,1
+nvfp8,fp8e4m3b,16,0,5,0.006,0.08,0.0012,1,100,252,1
+nvfp8,fp8e4m3b,16,5,0,0.005,0.07,0.0010,1,100,252,1
+nvfp8,fp8e4m3b,16,5,5,0.004,0.06,0.0008,1,100,252,1
