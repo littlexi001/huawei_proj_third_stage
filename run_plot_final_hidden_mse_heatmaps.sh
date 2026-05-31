@@ -9,4 +9,5 @@ python plot_final_hidden_mse_heatmaps.py \
   --metrics "${METRICS}" \
   --dpi "${DPI:-220}" \
   ${ANNOTATE:+--annotate} \
-  ${LOG_SCALE:+--log}
+  ${LOG_SCALE:+--log} \
+  ${COMBINED:+--combined}

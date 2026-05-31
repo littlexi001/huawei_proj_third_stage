@@ -42,6 +42,7 @@ def parse_args():
     p.add_argument("--dpi", type=int, default=220)
     p.add_argument("--annotate", action="store_true", help="Draw numeric values in each heatmap cell.")
     p.add_argument("--log", action="store_true", help="Use log10(metric) colors. Non-positive values become NA.")
+    p.add_argument("--combined", action="store_true", help="Also draw one combined figure containing all formats.")
     return p.parse_args()
 
 
@@ -188,6 +189,39 @@ def plot_metric(rows, formats, metric: str, save_dir: Path, dpi: int, annotate_v
     plt.close(fig)
 
 
+def plot_single_format(
+    rows,
+    fmt: str,
+    metric: str,
+    save_dir: Path,
+    dpi: int,
+    annotate_values: bool,
+    use_log: bool,
+) -> None:
+    wranks, xranks, mat = build_matrix(rows, fmt, metric)
+    cmat = matrix_for_color(mat, use_log)
+    label = f"log10({metric})" if use_log else metric
+
+    fig, ax = plt.subplots(figsize=(7.5, 6.2), constrained_layout=True)
+    im = ax.imshow(cmat, aspect="auto", interpolation="nearest", cmap="viridis_r")
+    ax.set_title(f"{fmt} Final Hidden State {label}")
+    ax.set_xlabel("Activation rank (rX)")
+    ax.set_ylabel("Weight rank (rW)")
+    ax.set_xticks(np.arange(len(xranks)))
+    ax.set_yticks(np.arange(len(wranks)))
+    ax.set_xticklabels([str(x) for x in xranks], rotation=45, ha="right")
+    ax.set_yticklabels([str(w) for w in wranks])
+    if annotate_values:
+        annotate(ax, mat, use_log)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(label)
+
+    suffix = "_log" if use_log else ""
+    fig.savefig(save_dir / f"heatmap_{metric}_{fmt}{suffix}.png", dpi=dpi, bbox_inches="tight")
+    fig.savefig(save_dir / f"heatmap_{metric}_{fmt}{suffix}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_matrix_csv(path: Path, wranks: List[int], xranks: List[int], mat: np.ndarray) -> None:
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
@@ -209,9 +243,18 @@ def main():
     save_dir.mkdir(parents=True, exist_ok=True)
 
     for metric in metrics:
-        plot_metric(rows, formats, metric, save_dir, args.dpi, args.annotate, use_log=False)
+        for fmt in formats:
+            wranks, xranks, mat = build_matrix(rows, fmt, metric)
+            np.save(save_dir / f"{fmt}_{metric}_matrix.npy", mat)
+            save_matrix_csv(save_dir / f"{fmt}_{metric}_matrix.csv", wranks, xranks, mat)
+            plot_single_format(rows, fmt, metric, save_dir, args.dpi, args.annotate, use_log=False)
         if args.log:
-            plot_metric(rows, formats, metric, save_dir, args.dpi, args.annotate, use_log=True)
+            for fmt in formats:
+                plot_single_format(rows, fmt, metric, save_dir, args.dpi, args.annotate, use_log=True)
+        if args.combined:
+            plot_metric(rows, formats, metric, save_dir, args.dpi, args.annotate, use_log=False)
+            if args.log:
+                plot_metric(rows, formats, metric, save_dir, args.dpi, args.annotate, use_log=True)
 
     print("[Done]")
     print(f"csv: {csv_path}")
