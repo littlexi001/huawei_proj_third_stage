@@ -1,0 +1,84 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+build/
+dist/
+*.log
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.so
+*.o
+*.a
+*.dll
+*.dylib
+*.exe
+
+# CMake / Ninja
+CMakeFiles/
+CMakeCache.txt
+*.ninja
+.ninja_deps
+.ninja_log
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temp
+*.tmp
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+*.so
+*.o
+*.a
+*.dll
+*.dylib
+*.exe
+
+# CMake / Ninja
+CMakeFiles/
+CMakeCache.txt
+*.ninja
+.ninja_deps
+.ninja_log
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temp
+*.tmp

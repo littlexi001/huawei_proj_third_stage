@@ -1,0 +1,43 @@
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# PDF files
+*.pdf
+*.html
+
+# PowerPoint files
+outputs/
+*.ppt
+*.pptx
+
+# Temporary files
+*.log
+*_temp.html
+convert_to_pdf*.py
+Metis/hif4_gpu/log.txt
+
+# Python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Hugging Face dataset cache; keep exported JSONL files under data/eval/
+data/hf_cache/
+
+# Generated experiment outputs are local and resumable
+data/results/
+
+# Native extension build artifacts
+**/build/
+*.o
+*.so
+*.dylib
+*.dll
