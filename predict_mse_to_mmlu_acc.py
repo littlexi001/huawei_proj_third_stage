@@ -459,6 +459,20 @@ def plot_results(out_dir: Path, fmt: str, rows: list[dict[str, Any]], matrix: Ac
         ax.set_yticks(range(len(kb_values)), kb_values)
         ax.set_xlabel("ka / xrank")
         ax.set_ylabel("kb / wrank")
+        threshold = (float(np.nanmin(data)) + float(np.nanmax(data))) / 2.0
+        for y_index in range(data.shape[0]):
+            for x_index in range(data.shape[1]):
+                value = float(data[y_index, x_index])
+                text_color = "white" if value < threshold else "black"
+                ax.text(
+                    x_index,
+                    y_index,
+                    f"{value:.4f}",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color=text_color,
+                )
         fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     fig.savefig(out_dir / f"{fmt}_acc_prediction_heatmaps.png", dpi=200)
     plt.close(fig)
