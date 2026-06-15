@@ -64,6 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--module-name-contains", default="")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="float16")
+    parser.add_argument("--proxy-device", default="cuda", help="Device used for MSE/SVD scoring; use cuda for speed, cpu to save VRAM")
+    parser.add_argument("--svd-method", choices=["lowrank", "exact"], default="lowrank")
+    parser.add_argument("--svd-oversample", type=int, default=8)
+    parser.add_argument("--svd-niter", type=int, default=2)
     parser.add_argument("--weight-only", action="store_true", help="Skip activation collection and fit from weight MSE only")
     parser.add_argument("--proxy-cache", default="", help="Optional JSON cache path for computed MSE features")
     parser.add_argument("--ridge", type=float, default=1e-6)
@@ -219,13 +223,22 @@ def residual_quant_scores(
     matrix: torch.Tensor,
     ranks: list[int],
     quantizer: Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+    svd_method: str,
+    oversample: int,
+    niter: int,
 ) -> dict[int, float]:
-    matrix = matrix.float()
+    matrix = matrix.to(device=device, dtype=torch.float32)
     denom = torch.linalg.norm(matrix).square().clamp_min(1e-12)
     max_rank = min(matrix.shape)
     effective_ranks = sorted({min(max(rank, 0), max_rank) for rank in ranks})
     if any(rank > 0 for rank in effective_ranks):
-        u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+        if svd_method == "lowrank":
+            q = min(max_rank, max(effective_ranks) + oversample)
+            u, s, v = torch.svd_lowrank(matrix, q=q, niter=niter)
+            vh = v.T
+        else:
+            u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
     scores_by_effective_rank = {}
     for rank in effective_ranks:
         if rank == 0:
@@ -292,6 +305,7 @@ def compute_proxy_features(args: argparse.Namespace, formats: list[str], ranks: 
         raise RuntimeError("No calibration data found. Pass --data or use --weight-only.")
 
     device = torch.device(args.device)
+    proxy_device = torch.device(args.proxy_device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -317,15 +331,33 @@ def compute_proxy_features(args: argparse.Namespace, formats: list[str], ranks: 
         module_rows = []
         for index, (name, module) in enumerate(modules, start=1):
             print(f"[proxy] {fmt} module {index}/{len(modules)} {name}", flush=True)
-            weight_scores = residual_quant_scores(module.weight.detach().float().cpu(), ranks, quantizer)
+            weight_scores = residual_quant_scores(
+                module.weight.detach(),
+                ranks,
+                quantizer,
+                proxy_device,
+                args.svd_method,
+                args.svd_oversample,
+                args.svd_niter,
+            )
             if args.weight_only:
                 act_scores = {rank: 0.0 for rank in ranks}
             else:
                 x = activations.get(name)
                 if x is None:
                     continue
-                act_scores = residual_quant_scores(x, ranks, quantizer)
+                act_scores = residual_quant_scores(
+                    x,
+                    ranks,
+                    quantizer,
+                    proxy_device,
+                    args.svd_method,
+                    args.svd_oversample,
+                    args.svd_niter,
+                )
             module_rows.append({"name": name, "weight_scores": weight_scores, "act_scores": act_scores})
+            if proxy_device.type == "cuda":
+                torch.cuda.empty_cache()
         proxy["formats"][fmt] = {"module_stats": module_rows}
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
