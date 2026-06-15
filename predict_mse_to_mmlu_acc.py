@@ -227,8 +227,15 @@ def residual_quant_scores(
     svd_method: str,
     oversample: int,
     niter: int,
+    debug_label: str = "",
 ) -> dict[int, float]:
     matrix = matrix.to(device=device, dtype=torch.float32)
+    if debug_label:
+        print(
+            f"[proxy-debug] {debug_label}: matrix_shape={tuple(matrix.shape)} "
+            f"matrix_device={matrix.device} svd_method={svd_method}",
+            flush=True,
+        )
     denom = torch.linalg.norm(matrix).square().clamp_min(1e-12)
     max_rank = min(matrix.shape)
     effective_ranks = sorted({min(max(rank, 0), max_rank) for rank in ranks})
@@ -306,6 +313,14 @@ def compute_proxy_features(args: argparse.Namespace, formats: list[str], ranks: 
 
     device = torch.device(args.device)
     proxy_device = torch.device(args.proxy_device)
+    print(
+        f"[proxy-debug] torch_cuda_available={torch.cuda.is_available()} "
+        f"cuda_device_count={torch.cuda.device_count()} "
+        f"model_device={device} proxy_device={proxy_device} "
+        f"svd_method={args.svd_method} svd_oversample={args.svd_oversample} "
+        f"svd_niter={args.svd_niter}",
+        flush=True,
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -339,6 +354,7 @@ def compute_proxy_features(args: argparse.Namespace, formats: list[str], ranks: 
                 args.svd_method,
                 args.svd_oversample,
                 args.svd_niter,
+                debug_label=f"{fmt} {name} weight" if index == 1 else "",
             )
             if args.weight_only:
                 act_scores = {rank: 0.0 for rank in ranks}
@@ -354,6 +370,7 @@ def compute_proxy_features(args: argparse.Namespace, formats: list[str], ranks: 
                     args.svd_method,
                     args.svd_oversample,
                     args.svd_niter,
+                    debug_label=f"{fmt} {name} activation" if index == 1 else "",
                 )
             module_rows.append({"name": name, "weight_scores": weight_scores, "act_scores": act_scores})
             if proxy_device.type == "cuda":
