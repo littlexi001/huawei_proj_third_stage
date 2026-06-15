@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import math
 import random
@@ -295,29 +296,40 @@ class SVDRQuantLinear(nn.Module):
         self.act_rank = int(act_rank)
         self.quantizer = quantizer
         self.svd_method = svd_method
-        self.compute_dtype = compute_dtype
 
         device = base_linear.weight.device
+        if device.type == "cpu" and compute_dtype in (torch.float16, torch.bfloat16):
+            compute_dtype = torch.float32
+        self.compute_dtype = compute_dtype
+        self.store_dtype = compute_dtype if isinstance(compute_dtype, torch.dtype) else torch.float16
+        self.out_features = base_linear.out_features
+
         w_fp = base_linear.weight.detach().float()
         if self.weight_rank <= 0:
-            w_m = torch.zeros_like(w_fp)
-            w_r = w_fp
+            w_rq = quantizer(w_fp)
+            self.register_buffer("weight_main", None, persistent=False)
+            self.register_buffer("weight_main_q", None, persistent=False)
+            self.register_buffer("weight_resid_q", w_rq.to(dtype=self.store_dtype, device=device), persistent=True)
         elif self.weight_rank >= min(w_fp.shape):
-            w_m = w_fp
-            w_r = torch.zeros_like(w_fp)
+            w_mq = quantizer(w_fp)
+            self.register_buffer("weight_main", w_fp.to(dtype=self.store_dtype, device=device), persistent=True)
+            self.register_buffer("weight_main_q", w_mq.to(dtype=self.store_dtype, device=device), persistent=True)
+            self.register_buffer("weight_resid_q", None, persistent=False)
         else:
             w_m = low_rank_approx(w_fp, self.weight_rank, svd_method)
             w_r = w_fp - w_m
-
-        w_mq = quantizer(w_m)
-        w_rq = quantizer(w_r)
-        self.register_buffer("weight_main", w_m.to(device=device), persistent=True)
-        self.register_buffer("weight_main_q", w_mq.to(device=device), persistent=True)
-        self.register_buffer("weight_resid_q", w_rq.to(device=device), persistent=True)
+            w_mq = quantizer(w_m)
+            w_rq = quantizer(w_r)
+            self.register_buffer("weight_main", w_m.to(dtype=self.store_dtype, device=device), persistent=True)
+            self.register_buffer("weight_main_q", w_mq.to(dtype=self.store_dtype, device=device), persistent=True)
+            self.register_buffer("weight_resid_q", w_rq.to(dtype=self.store_dtype, device=device), persistent=True)
         if base_linear.bias is None:
             self.bias = None
         else:
-            self.register_buffer("bias", base_linear.bias.detach().to(device=device), persistent=True)
+            self.register_buffer("bias", base_linear.bias.detach().to(dtype=self.store_dtype, device=device), persistent=True)
+        del w_fp
+        if torch.cuda.is_available() and device.type == "cuda":
+            torch.cuda.empty_cache()
 
     @torch.no_grad()
     def _decompose_activation(self, x: torch.Tensor):
@@ -344,15 +356,21 @@ class SVDRQuantLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_m, x_mq, x_rq = self._decompose_activation(x)
-        w_m = self.weight_main.to(dtype=self.compute_dtype)
-        w_mq = self.weight_main_q.to(dtype=self.compute_dtype)
-        w_rq = self.weight_resid_q.to(dtype=self.compute_dtype)
         bias = self.bias.to(dtype=self.compute_dtype) if self.bias is not None else None
 
-        out = torch.nn.functional.linear(x_m, w_m, bias)
-        out = out + torch.nn.functional.linear(x_mq, w_rq)
-        out = out + torch.nn.functional.linear(x_rq, w_mq)
-        out = out + torch.nn.functional.linear(x_rq, w_rq)
+        out = x.new_zeros((*x.shape[:-1], self.out_features), dtype=self.compute_dtype)
+        if bias is not None:
+            out = out + bias
+        if self.weight_main is not None:
+            w_m = self.weight_main.to(dtype=self.compute_dtype)
+            out = out + torch.nn.functional.linear(x_m, w_m)
+        if self.weight_resid_q is not None:
+            w_rq = self.weight_resid_q.to(dtype=self.compute_dtype)
+            out = out + torch.nn.functional.linear(x_mq, w_rq)
+            out = out + torch.nn.functional.linear(x_rq, w_rq)
+        if self.weight_main_q is not None:
+            w_mq = self.weight_main_q.to(dtype=self.compute_dtype)
+            out = out + torch.nn.functional.linear(x_rq, w_mq)
         return out
 
 

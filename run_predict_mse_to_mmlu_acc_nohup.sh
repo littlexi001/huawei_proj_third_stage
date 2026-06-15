@@ -50,6 +50,7 @@ cd "${ROOT_DIR}"
 
 export CUDA_VISIBLE_DEVICES
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 nohup "${PYTHON_BIN}" "${ROOT_DIR}/predict_mse_to_mmlu_acc.py" \
   --model-path "${MODEL_PATH}" \
