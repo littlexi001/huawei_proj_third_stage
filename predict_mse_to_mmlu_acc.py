@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
-"""Predict MMLU accuracy from fast Metis residual-MSE proxies.
+"""Predict MMLU accuracy from output-level hidden-state MSE.
 
-This script does not run downstream MMLU evaluation. It uses existing
-`acc_matrix.csv` files as supervision, samples a small set of anchor
-configurations from those matrices, fits a ridge response surface from MSE
-features to MMLU accuracy drop, then predicts every ka/kb grid point.
+This script actually runs the compressed model (SVD + quantization) on calibration
+data to compute the last-layer hidden-state MSE for every (ka, kb) grid point.
+It then uses a small set of anchor configurations (with known MMLU accuracy from
+acc_matrix.csv) to fit a ridge regression model: output_mse → MMLU accuracy drop.
+
+Workflow:
+  1. Load model, run forward pass → collect baseline (uncompressed) hidden states
+  2. For each (ka, kb) grid point:
+     a. SVD-decompose weights at rank=kb, quantize main & residual
+     b. Run forward pass (activations decomposed at rank=ka on the fly)
+     c. Compute last-hidden MSE vs baseline
+     NB: This is SLOW (~144 model loads/format), cached to proxy_mse_cache.json
+  3. From acc_matrix.csv, select anchor (ka,kb) points as training labels
+  4. Fit ridge regression: output_mse, ka, kb → accuracy_drop
+  5. Predict accuracy for all grid points, output feasible (ka,kb) configurations
 """
 
 from __future__ import annotations
@@ -65,7 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="float16")
     parser.add_argument("--proxy-device", default="cuda", help="Device used for MSE/SVD scoring; use cuda for speed, cpu to save VRAM")
-    parser.add_argument("--svd-method", choices=["lowrank", "exact"], default="lowrank")
+    parser.add_argument(
+        "--svd-method",
+        choices=["lowrank", "exact", "randomized", "full"],
+        default="lowrank",
+        help="'lowrank'/'randomized' use torch.svd_lowrank; 'exact'/'full' use torch.linalg.svd",
+    )
     parser.add_argument("--svd-oversample", type=int, default=8)
     parser.add_argument("--svd-niter", type=int, default=2)
     parser.add_argument("--weight-only", action="store_true", help="Skip activation collection and fit from weight MSE only")
@@ -144,20 +160,6 @@ def load_prompts(path: Path, limit: int, seed: int) -> list[str]:
     return [mmlu_prompt(row) for row in rows[: min(limit, len(rows))]]
 
 
-def selected_linear_modules(model: nn.Module, contains: str, max_modules: int) -> list[tuple[str, nn.Linear]]:
-    filters = [part.strip() for part in contains.split(",") if part.strip()]
-    modules = []
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear) or name.endswith("lm_head"):
-            continue
-        if filters and not any(token in name for token in filters):
-            continue
-        modules.append((name, module))
-        if max_modules and len(modules) >= max_modules:
-            break
-    return modules
-
-
 def quantize_hif8(x: torch.Tensor) -> torch.Tensor:
     x = x.float()
     x_unsigned = x.abs()
@@ -219,181 +221,371 @@ def get_quantizer(name: str) -> Callable[[torch.Tensor], torch.Tensor]:
     raise ValueError(f"Unsupported format: {name}")
 
 
-def residual_quant_scores(
-    matrix: torch.Tensor,
-    ranks: list[int],
-    quantizer: Callable[[torch.Tensor], torch.Tensor],
-    device: torch.device,
-    svd_method: str,
-    oversample: int,
-    niter: int,
-    debug_label: str = "",
-) -> dict[int, float]:
-    matrix = matrix.to(device=device, dtype=torch.float32)
-    if debug_label:
-        print(
-            f"[proxy-debug] {debug_label}: matrix_shape={tuple(matrix.shape)} "
-            f"matrix_device={matrix.device} svd_method={svd_method}",
-            flush=True,
+# --- SVD low-rank approximation utilities ---
+
+def _disabled_autocast(device_type: str):
+    if device_type == "cuda" and hasattr(torch, "autocast"):
+        return torch.autocast(device_type="cuda", enabled=False)
+    from contextlib import nullcontext
+
+    return nullcontext()
+
+
+@torch.no_grad()
+def low_rank_approx(x2d: torch.Tensor, rank: int, method: str) -> torch.Tensor:
+    """Compute rank-r SVD low-rank approximation of a 2D tensor.
+
+    Args:
+        method: 'exact' for torch.linalg.svd, 'lowrank' for torch.svd_lowrank (randomized).
+    """
+    with _disabled_autocast(x2d.device.type):
+        x32 = x2d.float().contiguous()
+        r = min(int(rank), min(x32.shape))
+        if r <= 0:
+            return torch.zeros_like(x32)
+        if r >= min(x32.shape):
+            return x32.clone()
+        if method in {"exact", "full"}:
+            u, s, vh = torch.linalg.svd(x32, full_matrices=False)
+            return (u[:, :r] * s[:r]) @ vh[:r, :]
+        if method in {"lowrank", "randomized"}:
+            u, s, v = torch.svd_lowrank(x32, q=r, niter=2)
+            return (u[:, :r] * s[:r]) @ v[:, :r].T
+        raise ValueError(f"Unknown SVD method: {method}")
+
+
+# --- SVD + Quantize Residual Linear Layer ---
+
+TARGET_LINEAR_SUFFIXES = {
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+}
+
+
+class SVDRQuantLinear(nn.Module):
+    """Linear layer with SVD low-rank decomposition + residual quantization.
+
+    Decomposes weight W into main (low-rank) W_m and residual W_r:
+        W = W_m + W_r,   W_m = low_rank_approx(W, weight_rank)
+
+    Decomposes input activation X into main (low-rank) X_m and residual X_r:
+        X = X_m + X_r,   X_m = low_rank_approx(X, act_rank)
+
+    Forward pass computes four cross terms:
+        out = X_m @ W_m^T + X_mq @ W_rq^T + X_rq @ W_mq^T + X_rq @ W_rq^T
+    where _q suffix denotes quantized versions.
+    """
+
+    def __init__(
+        self,
+        base_linear: nn.Linear,
+        weight_rank: int,
+        act_rank: int,
+        quantizer: Callable[[torch.Tensor], torch.Tensor],
+        svd_method: str,
+        compute_dtype: torch.dtype,
+    ):
+        super().__init__()
+        self.weight_rank = int(weight_rank)
+        self.act_rank = int(act_rank)
+        self.quantizer = quantizer
+        self.svd_method = svd_method
+        self.compute_dtype = compute_dtype
+
+        device = base_linear.weight.device
+        w_fp = base_linear.weight.detach().float()
+        if self.weight_rank <= 0:
+            w_m = torch.zeros_like(w_fp)
+            w_r = w_fp
+        elif self.weight_rank >= min(w_fp.shape):
+            w_m = w_fp
+            w_r = torch.zeros_like(w_fp)
+        else:
+            w_m = low_rank_approx(w_fp, self.weight_rank, svd_method)
+            w_r = w_fp - w_m
+
+        w_mq = quantizer(w_m)
+        w_rq = quantizer(w_r)
+        self.register_buffer("weight_main", w_m.to(device=device), persistent=True)
+        self.register_buffer("weight_main_q", w_mq.to(device=device), persistent=True)
+        self.register_buffer("weight_resid_q", w_rq.to(device=device), persistent=True)
+        if base_linear.bias is None:
+            self.bias = None
+        else:
+            self.register_buffer("bias", base_linear.bias.detach().to(device=device), persistent=True)
+
+    @torch.no_grad()
+    def _decompose_activation(self, x: torch.Tensor):
+        orig_shape = x.shape
+        hidden = orig_shape[-1]
+        x_fp = x.reshape(-1, hidden).float()
+        if self.act_rank <= 0:
+            x_m = torch.zeros_like(x_fp)
+            x_r = x_fp
+        elif self.act_rank >= min(x_fp.shape):
+            x_m = x_fp
+            x_r = torch.zeros_like(x_fp)
+        else:
+            x_m = low_rank_approx(x_fp, self.act_rank, self.svd_method)
+            x_r = x_fp - x_m
+
+        x_mq = self.quantizer(x_m)
+        x_rq = self.quantizer(x_r)
+        return (
+            x_m.reshape(orig_shape).to(dtype=self.compute_dtype),
+            x_mq.reshape(orig_shape).to(dtype=self.compute_dtype),
+            x_rq.reshape(orig_shape).to(dtype=self.compute_dtype),
         )
-    denom = torch.linalg.norm(matrix).square().clamp_min(1e-12)
-    max_rank = min(matrix.shape)
-    effective_ranks = sorted({min(max(rank, 0), max_rank) for rank in ranks})
-    if any(rank > 0 for rank in effective_ranks):
-        if svd_method == "lowrank":
-            q = min(max_rank, max(effective_ranks) + oversample)
-            u, s, v = torch.svd_lowrank(matrix, q=q, niter=niter)
-            vh = v.T
-        else:
-            u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
-    scores_by_effective_rank = {}
-    for rank in effective_ranks:
-        if rank == 0:
-            residual = matrix
-        else:
-            head = (u[:, :rank] * s[:rank]) @ vh[:rank, :]
-            residual = matrix - head
-        q_residual = quantizer(residual)
-        err = torch.linalg.norm(q_residual - residual).square()
-        scores_by_effective_rank[rank] = float((err / denom).cpu())
-    return {rank: scores_by_effective_rank[min(max(rank, 0), max_rank)] for rank in ranks}
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_m, x_mq, x_rq = self._decompose_activation(x)
+        w_m = self.weight_main.to(dtype=self.compute_dtype)
+        w_mq = self.weight_main_q.to(dtype=self.compute_dtype)
+        w_rq = self.weight_resid_q.to(dtype=self.compute_dtype)
+        bias = self.bias.to(dtype=self.compute_dtype) if self.bias is not None else None
+
+        out = torch.nn.functional.linear(x_m, w_m, bias)
+        out = out + torch.nn.functional.linear(x_mq, w_rq)
+        out = out + torch.nn.functional.linear(x_rq, w_mq)
+        out = out + torch.nn.functional.linear(x_rq, w_rq)
+        return out
 
 
-def collect_activations(
+def patch_model_linears(
+    model: nn.Module,
+    weight_rank: int,
+    act_rank: int,
+    quantizer: Callable[[torch.Tensor], torch.Tensor],
+    svd_method: str,
+    compute_dtype: torch.dtype,
+    module_name_contains: str,
+) -> list[str]:
+    """Replace target nn.Linear layers with SVDRQuantLinear."""
+    filters = [part.strip() for part in module_name_contains.split(",") if part.strip()]
+    replaced = []
+
+    def _get_parent(root: nn.Module, module_name: str):
+        parts = module_name.split(".")
+        parent = root
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        return parent, parts[-1]
+
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear) or module_name.endswith("lm_head"):
+            continue
+        if not any(module_name.endswith(suf) for suf in TARGET_LINEAR_SUFFIXES):
+            continue
+        if filters and not any(token in module_name for token in filters):
+            continue
+        parent, child_name = _get_parent(model, module_name)
+        setattr(
+            parent,
+            child_name,
+            SVDRQuantLinear(
+                module, weight_rank, act_rank, quantizer, svd_method, compute_dtype,
+            ),
+        )
+        replaced.append(module_name)
+    return replaced
+
+
+# --- Output hidden-state collection & MSE computation ---
+
+@torch.no_grad()
+def collect_output_hidden(
     model: nn.Module,
     tokenizer: Any,
     prompts: list[str],
-    modules: list[tuple[str, nn.Linear]],
-    max_rows: int,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
-    samples: dict[str, list[torch.Tensor]] = {name: [] for name, _ in modules}
-    row_counts = {name: 0 for name, _ in modules}
-    handles = []
-
-    def make_hook(name: str):
-        def hook(_module: nn.Module, inputs: tuple[torch.Tensor, ...], _output: torch.Tensor) -> None:
-            if row_counts[name] >= max_rows:
-                return
-            x = inputs[0].detach().float().cpu().reshape(-1, inputs[0].shape[-1])
-            need = max_rows - row_counts[name]
-            if x.shape[0] > need:
-                x = x[:need]
-            samples[name].append(x)
-            row_counts[name] += x.shape[0]
-        return hook
-
-    for name, module in modules:
-        handles.append(module.register_forward_hook(make_hook(name)))
-
+    dtype: torch.dtype,
+    desc: str = "",
+) -> torch.Tensor:
+    """Run forward pass on calibration prompts, collect last hidden states (on valid tokens)."""
+    chunks: list[torch.Tensor] = []
     model.eval()
     with torch.inference_mode():
-        for prompt in prompts:
+        pbar = prompts
+        if desc:
+            from tqdm import tqdm as _tqdm
+            pbar = _tqdm(prompts, desc=desc)
+        for prompt in pbar:
             encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-            encoded = {key: value.to(device) for key, value in encoded.items()}
-            model(**encoded, use_cache=False)
-            if all(count >= max_rows for count in row_counts.values()):
-                break
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            out = model(**encoded, output_hidden_states=True, use_cache=False)
+            hidden = out.hidden_states[-1].detach().float().cpu()  # last layer hidden
+            mask = encoded["attention_mask"].detach().cpu().bool()
+            chunks.append(hidden[mask])  # keep only non-padding tokens
+    return torch.cat(chunks, dim=0)
 
-    for handle in handles:
-        handle.remove()
-    return {name: torch.cat(chunks, dim=0) for name, chunks in samples.items() if chunks}
+
+def mse_between_outputs(cur: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
+    """Compute MSE / RMSE / relative MSE between compressed and reference hidden states."""
+    if cur.shape != ref.shape:
+        raise ValueError(f"Shape mismatch: cur={tuple(cur.shape)}, ref={tuple(ref.shape)}")
+    diff = cur - ref
+    sse = float(diff.square().sum())
+    ref_norm_sq = float(ref.square().sum())
+    count = diff.numel()
+    mse_val = sse / max(count, 1)
+    return {
+        "mse": mse_val,
+        "rmse": mse_val ** 0.5,
+        "relative_mse": sse / max(ref_norm_sq, 1e-30),
+        "max_abs": float(diff.abs().max()),
+        "num_values": count,
+    }
 
 
 def compute_proxy_features(args: argparse.Namespace, formats: list[str], ranks: list[int]) -> dict[str, Any]:
+    """Compute output-level hidden-state MSE for every (ka, kb) grid point.
+
+    For each (ka, kb) combination:
+    1. SVD-decompose all Linear weights at rank=kb, quantize main & residual
+    2. Run forward pass with activation SVD-decomposition at rank=ka
+    3. Compare last hidden states with uncompressed baseline → output MSE
+    """
     cache_path = Path(args.proxy_cache) if args.proxy_cache else Path(args.output_dir) / "proxy_mse_cache.json"
+    expected_keys = {f"{ka}_{kb}" for ka in ranks for kb in ranks}
+    proxy: dict[str, Any] = {"mode": "last_hidden_output_mse", "ranks": ranks, "formats": {}}
     if cache_path.exists():
-        return json.loads(cache_path.read_text(encoding="utf-8-sig"))
+        cached = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+        if cached.get("mode") == "last_hidden_output_mse":
+            proxy = cached
+            complete = True
+            for fmt in formats:
+                output_mse_map = proxy.get("formats", {}).get(fmt, {}).get("output_mse_map", {})
+                if set(output_mse_map) & expected_keys != expected_keys:
+                    complete = False
+                    break
+            if complete:
+                print(f"[proxy] loading complete cached output MSE features from {cache_path}")
+                return proxy
+            print(f"[proxy] resuming incomplete output MSE cache from {cache_path}", flush=True)
+        else:
+            print(f"[proxy] ignoring incompatible cache at {cache_path}; expected last_hidden_output_mse mode", flush=True)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     data_path = resolve_data_path(args.data)
-    if not args.weight_only and data_path is None:
-        raise RuntimeError("No calibration data found. Pass --data or use --weight-only.")
+    if data_path is None:
+        raise RuntimeError("No calibration data found. Pass --data.")
 
     device = torch.device(args.device)
-    proxy_device = torch.device(args.proxy_device)
+    compute_dtype = dtype_from_arg(args.dtype)
     print(
-        f"[proxy-debug] torch_cuda_available={torch.cuda.is_available()} "
+        f"[proxy] torch_cuda_available={torch.cuda.is_available()} "
         f"cuda_device_count={torch.cuda.device_count()} "
-        f"model_device={device} proxy_device={proxy_device} "
-        f"svd_method={args.svd_method} svd_oversample={args.svd_oversample} "
-        f"svd_niter={args.svd_niter}",
+        f"device={device} dtype={args.dtype} svd_method={args.svd_method}",
         flush=True,
     )
+
+    # --- Load model & tokenizer once ---
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    prompts = load_prompts(data_path, args.limit, args.seed)
+    print(f"[proxy] loaded {len(prompts)} calibration prompts", flush=True)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=dtype_from_arg(args.dtype),
+        torch_dtype=compute_dtype if isinstance(compute_dtype, torch.dtype) else None,
         trust_remote_code=True,
         device_map=None,
     ).to(device)
-    modules = selected_linear_modules(model, args.module_name_contains, args.max_modules)
-    if not modules:
-        raise RuntimeError("No Linear modules selected")
+    print(f"[proxy] loaded model {args.model_path}", flush=True)
 
-    activations = {}
-    if not args.weight_only:
-        prompts = load_prompts(data_path, args.limit, args.seed)
-        activations = collect_activations(model, tokenizer, prompts, modules, args.max_act_rows, device)
+    # --- Collect baseline (uncompressed) last hidden states ---
+    print("[proxy] collecting baseline hidden states ...", flush=True)
+    ref_hidden = collect_output_hidden(model, tokenizer, prompts, device, compute_dtype, desc="baseline")
+    print(f"[proxy] baseline hidden states: shape={tuple(ref_hidden.shape)}", flush=True)
 
-    proxy: dict[str, Any] = {"ranks": ranks, "formats": {}}
+    # --- Compute output MSE for each (ka, kb) grid point ---
+    # Count how many Linear layers will be patched
+    candidate_names = []
+    for module_name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear) or module_name.endswith("lm_head"):
+            continue
+        if not any(module_name.endswith(suf) for suf in TARGET_LINEAR_SUFFIXES):
+            continue
+        filters = [part.strip() for part in args.module_name_contains.split(",") if part.strip()]
+        if filters and not any(token in module_name for token in filters):
+            continue
+        candidate_names.append(module_name)
+    print(f"[proxy] will patch {len(candidate_names)} Linear layers", flush=True)
+
+    # Free baseline model (keep ref_hidden on CPU for comparison)
+    del model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     for fmt in formats:
-        print(f"[proxy] scoring {fmt}", flush=True)
+        print(f"\n[proxy] === format: {fmt} ===", flush=True)
         quantizer = get_quantizer(fmt)
-        module_rows = []
-        for index, (name, module) in enumerate(modules, start=1):
-            print(f"[proxy] {fmt} module {index}/{len(modules)} {name}", flush=True)
-            weight_scores = residual_quant_scores(
-                module.weight.detach(),
-                ranks,
-                quantizer,
-                proxy_device,
-                args.svd_method,
-                args.svd_oversample,
-                args.svd_niter,
-                debug_label=f"{fmt} {name} weight" if index == 1 else "",
-            )
-            if args.weight_only:
-                act_scores = {rank: 0.0 for rank in ranks}
-            else:
-                x = activations.get(name)
-                if x is None:
+        output_mse_map: dict[str, dict[str, float]] = proxy.get("formats", {}).get(fmt, {}).get("output_mse_map", {})
+
+        total = len(ranks) * len(ranks)
+        count = 0
+        for ka in ranks:
+            for kb in ranks:
+                count += 1
+                key = f"{ka}_{kb}"
+                if key in output_mse_map:
+                    print(f"[proxy] {fmt} [{count}/{total}] ka={ka} kb={kb} skip cached", flush=True)
                     continue
-                act_scores = residual_quant_scores(
-                    x,
-                    ranks,
-                    quantizer,
-                    proxy_device,
-                    args.svd_method,
-                    args.svd_oversample,
-                    args.svd_niter,
-                    debug_label=f"{fmt} {name} activation" if index == 1 else "",
+                print(f"[proxy] {fmt} [{count}/{total}] ka={ka} kb={kb}", flush=True)
+
+                # Reload fresh model
+                model = AutoModelForCausalLM.from_pretrained(
+                    args.model_path,
+                    torch_dtype=compute_dtype if isinstance(compute_dtype, torch.dtype) else None,
+                    trust_remote_code=True,
+                    device_map=None,
+                ).to(device)
+
+                # Patch model with SVD + quantize residual layers
+                replaced = patch_model_linears(
+                    model,
+                    weight_rank=kb,
+                    act_rank=ka,
+                    quantizer=quantizer,
+                    svd_method=args.svd_method,
+                    compute_dtype=compute_dtype if isinstance(compute_dtype, torch.dtype) else torch.float16,
+                    module_name_contains=args.module_name_contains,
                 )
-            module_rows.append({"name": name, "weight_scores": weight_scores, "act_scores": act_scores})
-            if proxy_device.type == "cuda":
-                torch.cuda.empty_cache()
-        proxy["formats"][fmt] = {"module_stats": module_rows}
+                if count == 1:
+                    print(f"[proxy] {fmt} patched {len(replaced)} modules (e.g. {replaced[:3]})", flush=True)
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(proxy, indent=2), encoding="utf-8")
+                # Collect compressed hidden states & compute MSE vs baseline
+                cur_hidden = collect_output_hidden(
+                    model, tokenizer, prompts, device, compute_dtype,
+                    desc=f"{fmt} ka={ka} kb={kb}",
+                )
+                metrics = mse_between_outputs(cur_hidden, ref_hidden)
+                output_mse_map[key] = metrics
+                print(f"[proxy] {fmt} [{count}/{total}] ka={ka} kb={kb} mse={metrics['mse']:.6f} rmse={metrics['rmse']:.6f}", flush=True)
+
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # Save incremental cache (so partial progress is preserved)
+                proxy["formats"][fmt] = {"output_mse_map": output_mse_map}
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps(proxy, indent=2), encoding="utf-8")
+
+        proxy["formats"][fmt] = {"output_mse_map": output_mse_map}
+
+    print(f"[proxy] done. cache saved to {cache_path}", flush=True)
     return proxy
-
-
-def aggregate_scores(module_stats: list[dict[str, Any]]) -> tuple[dict[int, float], dict[int, float]]:
-    act: dict[int, list[float]] = {}
-    weight: dict[int, list[float]] = {}
-    for stats in module_stats:
-        for rank, value in stats["act_scores"].items():
-            act.setdefault(int(rank), []).append(float(value))
-        for rank, value in stats["weight_scores"].items():
-            weight.setdefault(int(rank), []).append(float(value))
-    return (
-        {rank: float(np.mean(values)) for rank, values in act.items()},
-        {rank: float(np.mean(values)) for rank, values in weight.items()},
-    )
 
 
 def zscore(x: np.ndarray, mean: float | None = None, std: float | None = None) -> tuple[np.ndarray, float, float]:
@@ -410,18 +602,19 @@ def build_feature_matrix(
     rows: list[dict[str, float]],
     stats: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[np.ndarray, dict[str, tuple[float, float]]]:
+    """Build feature matrix with output_mse (last-hidden MSE), ka, kb as features.
+
+    Features: [1 (intercept), output_mse, ka, kb, ka*kb]
+    All features are z-score normalized for numerical stability.
+    """
     stats = {} if stats is None else dict(stats)
-    act, mean, std = zscore(np.array([row["activation_mse"] for row in rows]), *stats.get("activation_mse", (None, None)))
-    stats["activation_mse"] = (mean, std)
-    weight, mean, std = zscore(np.array([row["weight_mse"] for row in rows]), *stats.get("weight_mse", (None, None)))
-    stats["weight_mse"] = (mean, std)
-    proxy, mean, std = zscore(np.array([row["proxy_mse"] for row in rows]), *stats.get("proxy_mse", (None, None)))
-    stats["proxy_mse"] = (mean, std)
+    out_mse, mean, std = zscore(np.array([row["output_mse"] for row in rows]), *stats.get("output_mse", (None, None)))
+    stats["output_mse"] = (mean, std)
     ka, mean, std = zscore(np.array([row["ka"] for row in rows], dtype=np.float64), *stats.get("ka", (None, None)))
     stats["ka"] = (mean, std)
     kb, mean, std = zscore(np.array([row["kb"] for row in rows], dtype=np.float64), *stats.get("kb", (None, None)))
     stats["kb"] = (mean, std)
-    features = np.column_stack([np.ones(len(rows)), act, weight, act * weight, proxy, ka, kb, ka * kb])
+    features = np.column_stack([np.ones(len(rows)), out_mse, ka, kb, ka * kb])
     return features, stats
 
 
@@ -509,8 +702,7 @@ def run_format(
 ) -> dict[str, Any]:
     matrix = load_acc_matrix(acc_csv)
     baseline_acc = args.baseline_acc if args.baseline_acc is not None else max(matrix.values.values())
-    module_stats = proxy_data["formats"][fmt]["module_stats"]
-    act_scores, weight_scores = aggregate_scores(module_stats)
+    output_mse_map = proxy_data["formats"][fmt]["output_mse_map"]
 
     rows = []
     for kb in matrix.kb_values:
@@ -518,16 +710,21 @@ def run_format(
             if ka not in ranks or kb not in ranks:
                 continue
             actual_acc = matrix.values[(ka, kb)]
-            activation_mse = act_scores.get(ka, 0.0)
-            weight_mse = weight_scores.get(kb, 0.0)
+            key = f"{ka}_{kb}"
+            if key not in output_mse_map:
+                raise RuntimeError(
+                    f"{fmt}: missing output MSE for ka={ka}, kb={kb}. "
+                    "Delete incompatible cache or rerun to resume missing grid points."
+                )
+            mse_info = output_mse_map[key]
             rows.append(
                 {
                     "format": fmt,
                     "ka": ka,
                     "kb": kb,
-                    "activation_mse": activation_mse,
-                    "weight_mse": weight_mse,
-                    "proxy_mse": activation_mse + weight_mse,
+                    "output_mse": mse_info.get("mse", 0.0),
+                    "output_rmse": mse_info.get("rmse", 0.0),
+                    "output_relative_mse": mse_info.get("relative_mse", 0.0),
                     "actual_acc": actual_acc,
                     "actual_acc_drop": baseline_acc - actual_acc,
                     "rank_cost": args.ka_cost * ka + args.kb_cost * kb,
