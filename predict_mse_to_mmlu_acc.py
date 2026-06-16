@@ -660,6 +660,7 @@ def plot_results(out_dir: Path, fmt: str, rows: list[dict[str, Any]], matrix: Ac
     kb_values = matrix.kb_values
     actual = np.array([[next(r["actual_acc"] for r in rows if r["ka"] == ka and r["kb"] == kb) for ka in ka_values] for kb in kb_values])
     pred = np.array([[next(r["pred_acc"] for r in rows if r["ka"] == ka and r["kb"] == kb) for ka in ka_values] for kb in kb_values])
+    anchors = np.array([[next(r["is_anchor"] for r in rows if r["ka"] == ka and r["kb"] == kb) for ka in ka_values] for kb in kb_values])
     error = pred - actual
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
@@ -678,7 +679,7 @@ def plot_results(out_dir: Path, fmt: str, rows: list[dict[str, Any]], matrix: Ac
                 ax.text(
                     x_index,
                     y_index,
-                    f"{value:.4f}",
+                    f"{value:.4f}" + ("*" if anchors[y_index, x_index] else ""),
                     ha="center",
                     va="center",
                     fontsize=6,
@@ -762,18 +763,33 @@ def run_format(
     predictions = x_all @ beta
 
     for row, pred_drop in zip(rows, predictions):
-        row["pred_acc_drop"] = float(pred_drop)
-        row["pred_acc"] = float(baseline_acc - pred_drop)
+        is_anchor = (row["ka"], row["kb"]) in anchor_set
+        model_pred_drop = float(pred_drop)
+        model_pred_acc = float(baseline_acc - model_pred_drop)
+        row["model_pred_acc_drop"] = model_pred_drop
+        row["model_pred_acc"] = model_pred_acc
+        row["model_pred_error"] = float(model_pred_acc - row["actual_acc"])
+        row["abs_model_pred_error"] = abs(row["model_pred_error"])
+        if is_anchor:
+            row["pred_acc_drop"] = float(row["actual_acc_drop"])
+            row["pred_acc"] = float(row["actual_acc"])
+            row["pred_source"] = "actual_anchor"
+        else:
+            row["pred_acc_drop"] = model_pred_drop
+            row["pred_acc"] = model_pred_acc
+            row["pred_source"] = "ridge_prediction"
         row["pred_error"] = float(row["pred_acc"] - row["actual_acc"])
         row["abs_pred_error"] = abs(row["pred_error"])
         row["feasible_pred"] = row["pred_acc_drop"] <= args.max_acc_drop
         row["feasible_actual"] = row["actual_acc_drop"] <= args.max_acc_drop
-        row["is_anchor"] = (row["ka"], row["kb"]) in anchor_set
+        row["is_anchor"] = is_anchor
 
     feasible = [row for row in rows if row["feasible_pred"]]
     feasible.sort(key=lambda row: (row["rank_cost"], row["pred_acc_drop"], row["ka"], row["kb"]))
-    errors = np.array([row["pred_error"] for row in rows], dtype=np.float64)
-    abs_errors = np.abs(errors)
+    model_errors = np.array([row["model_pred_error"] for row in rows], dtype=np.float64)
+    model_abs_errors = np.abs(model_errors)
+    non_anchor_errors = np.array([row["model_pred_error"] for row in rows if not row["is_anchor"]], dtype=np.float64)
+    non_anchor_abs_errors = np.abs(non_anchor_errors) if len(non_anchor_errors) else np.array([], dtype=np.float64)
     best = feasible[0] if feasible else None
     summary = {
         "format": fmt,
@@ -784,9 +800,12 @@ def run_format(
         "num_anchors": len(train_indices),
         "anchors": anchors,
         "feature_stats": {key: {"mean": value[0], "std": value[1]} for key, value in feature_stats.items()},
-        "mae": float(abs_errors.mean()),
-        "rmse": float(np.sqrt(np.mean(errors**2))),
-        "max_abs_error": float(abs_errors.max()),
+        "model_pred_mae_all": float(model_abs_errors.mean()),
+        "model_pred_rmse_all": float(np.sqrt(np.mean(model_errors**2))),
+        "model_pred_max_abs_error_all": float(model_abs_errors.max()),
+        "model_pred_mae_non_anchor": float(non_anchor_abs_errors.mean()) if len(non_anchor_abs_errors) else None,
+        "model_pred_rmse_non_anchor": float(np.sqrt(np.mean(non_anchor_errors**2))) if len(non_anchor_errors) else None,
+        "model_pred_max_abs_error_non_anchor": float(non_anchor_abs_errors.max()) if len(non_anchor_abs_errors) else None,
         "num_pred_feasible": len(feasible),
         "num_actual_feasible": sum(1 for row in rows if row["feasible_actual"]),
         "best_min_cost_pred_feasible": best,
