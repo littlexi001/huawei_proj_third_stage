@@ -36,6 +36,12 @@ def parse_args():
         default=220,
         help="输出图片 DPI",
     )
+    p.add_argument(
+        "--task_name",
+        type=str,
+        default="MMLU",
+        help="title prefix, e.g. MMLU or GSM8K",
+    )
     return p.parse_args()
 
 
@@ -77,13 +83,20 @@ def extract_acc_from_summary(summary_path: Path):
 
 
 def collect_results(root: Path):
-    pattern = re.compile(r"wrank_(\d+)_xrank_(\d+)")
+    patterns = [
+        re.compile(r"wrank_(\d+)_xrank_(\d+)"),
+        re.compile(r"kb_(\d+)_ka_(\d+)"),
+    ]
     results = {}
 
     for sub in sorted(root.iterdir()):
         if not sub.is_dir():
             continue
-        m = pattern.fullmatch(sub.name)
+        m = None
+        for pattern in patterns:
+            m = pattern.fullmatch(sub.name)
+            if m:
+                break
         if not m:
             continue
 
@@ -223,7 +236,7 @@ def main():
         mat=acc_mat,
         wranks=wranks,
         xranks=xranks,
-        title="MMLU overall_acc Heatmap",
+        title=f"{args.task_name} overall_acc Heatmap",
         cbar_label="overall_acc",
         save_path=save_dir / "heatmap_overall_acc.png",
         value_fmt="{:.5f}",
@@ -235,7 +248,7 @@ def main():
         mat=rel_pct_mat,
         wranks=wranks,
         xranks=xranks,
-        title=f"MMLU Relative Change vs Baseline={baseline:.5f}",
+        title=f"{args.task_name} Relative Change vs Baseline={baseline:.5f}",
         cbar_label="relative change",
         save_path=save_dir / "heatmap_relative_percent.png",
         value_fmt="{:+.3f}",
@@ -247,7 +260,7 @@ def main():
         mat=acc_mat,
         wranks=wranks,
         xranks=xranks,
-        title="MMLU overall_acc Heatmap",
+        title=f"{args.task_name} overall_acc Heatmap",
         cbar_label="overall_acc",
         save_path=save_dir / "heatmap_overall_acc.pdf",
         value_fmt="{:.3f}",
@@ -259,7 +272,7 @@ def main():
         mat=rel_pct_mat,
         wranks=wranks,
         xranks=xranks,
-        title=f"MMLU Relative Change vs Baseline={baseline:.3f} (%)",
+        title=f"{args.task_name} Relative Change vs Baseline={baseline:.3f} (%)",
         cbar_label="relative change (%)",
         save_path=save_dir / "heatmap_relative_percent.pdf",
         value_fmt="{:+.1f}",
